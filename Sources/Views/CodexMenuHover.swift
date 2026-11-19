@@ -15,6 +15,7 @@ final class CodexMenuHover: ObservableObject {
     private var generation = 0
     private var isWatching = false
     private var isEditing = false
+    private var awaitingPointerEntry = false
 
     func setEditing(_ value: Bool) {
         isEditing = value
@@ -26,10 +27,11 @@ final class CodexMenuHover: ObservableObject {
         } else { sample(NSEvent.mouseLocation) }
     }
 
-    func start() {
+    func start(keyboard: Bool = false) {
         stop()
         dismissRequested = false
         isWatching = true
+        awaitingPointerEntry = keyboard
         MouseTracker.shared.addMoveObserver(observerID) { [weak self] point in self?.sample(point) }
         sample(NSEvent.mouseLocation)
     }
@@ -50,7 +52,12 @@ final class CodexMenuHover: ObservableObject {
         }
         if let window = menuView?.window, window.isVisible { regions.append(window.frame) }
         let now = ProcessInfo.processInfo.systemUptime
-        dismissal.update(isInside: HoverDismissal.contains(point, in: regions), now: now)
+        let isInside = HoverDismissal.contains(point, in: regions)
+        if awaitingPointerEntry {
+            guard isInside else { return }
+            awaitingPointerEntry = false
+        }
+        dismissal.update(isInside: isInside, now: now)
         guard let deadline = dismissal.deadline else {
             generation += 1
             closeWork?.cancel(); closeWork = nil

@@ -76,7 +76,7 @@ Keep the private signing key in the release maintainer's Keychain.
 ```sh
 source ./release.env.example
 ./build.sh --universal --package
-./Tools/make-appcast.sh dist/FunNotch-1.11.0.dmg
+./Tools/make-appcast.sh dist/FunNotch-1.11.1.dmg
 ```
 
 The current downloadable release targets Apple silicon and is ad-hoc signed; it

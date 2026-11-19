@@ -31,8 +31,8 @@ cd "$(dirname "$0")"
 
 APP_NAME="FunNotch"
 BUNDLE_ID="com.funnotch.FunNotch"
-VERSION="1.11.0"
-BUILD_NUMBER="59"
+VERSION="1.11.1"
+BUILD_NUMBER="60"
 MIN_MACOS="14.0"
 SDK_PATH="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
 

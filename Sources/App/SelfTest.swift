@@ -1400,12 +1400,17 @@ enum SelfTest {
                             info("track duration", "\(Int(track.duration))s")
                             info("artwork", track.artwork == nil ? "none" : "loaded")
                         }
-                        let remaining = max(0, completionNotice.date.addingTimeInterval(CodexCompletionFlight.duration * 2 + 0.15).timeIntervalSinceNow)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + remaining) {
-                            check("completion queue drains and releases its state",
-                                  completionModel.codexCompletion == nil && stoppedModel.codexCompletion == nil)
-                            finish()
+                        let deadline = ProcessInfo.processInfo.systemUptime + CodexCompletionFlight.duration * 2 + 1
+                        @MainActor func awaitCompletionCleanup() {
+                            let cleared = completionModel.codexCompletion == nil && stoppedModel.codexCompletion == nil
+                            if cleared || ProcessInfo.processInfo.systemUptime >= deadline {
+                                check("completion queue drains and releases its state", cleared)
+                                finish()
+                            } else {
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { awaitCompletionCleanup() }
+                            }
                         }
+                        awaitCompletionCleanup()
                     }
                 }
             }

@@ -6,6 +6,16 @@
         <description>Signed updates for FunNotch Sakura</description>
         <language>en</language>
         <item>
+            <title>1.11.1</title>
+            <pubDate>Thu, 19 Nov 2026 10:35:27 +0300</pubDate>
+            <link>https://github.com/argonq1/funnotch-sakura</link>
+            <sparkle:version>60</sparkle:version>
+            <sparkle:shortVersionString>1.11.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/argonq1/funnotch-sakura/releases/download/v1.11.1/FunNotch-1.11.1.dmg" length="5658318" type="application/octet-stream" sparkle:edSignature="AhpsWmzUGZSpphL5TV6inDtwZJc9jR5Zkee9wovNUx3S0cHr2sAUUiXhocWTneDUoi6JoxvHz3b1bqo3Jg7vBw=="/>
+        </item>
+        <item>
             <title>1.11.0</title>
             <pubDate>Thu, 19 Nov 2026 10:26:38 +0300</pubDate>
             <link>https://github.com/argonq1/funnotch-sakura</link>

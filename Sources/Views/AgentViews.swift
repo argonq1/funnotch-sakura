@@ -333,6 +333,7 @@ struct ActiveCodexBadge: View {
     @EnvironmentObject private var viewModel: NotchViewModel
     @StateObject private var hover = CodexMenuHover()
     @State private var expanded = false
+    @State private var keyboardPresentation = false
     @State private var hovered = false
     @State private var previousPin = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -340,7 +341,7 @@ struct ActiveCodexBadge: View {
 
     var body: some View {
         let working = agents.activeCodex.contains { $0.status == .working }
-        Button { expanded.toggle() } label: {
+        Button { keyboardPresentation = false; expanded.toggle() } label: {
             HStack(spacing: 5) {
                 CodexBrandMark().frame(width: 18, height: 18)
                 if viewModel.usesPhysicalCutout {
@@ -395,10 +396,14 @@ struct ActiveCodexBadge: View {
             .help("Codex: \(agents.activeCodex.count) в работе. Открыть меню чатов")
             .accessibilityLabel("Меню Codex. В работе: \(agents.activeCodex.count). Открыть чаты")
             .onReceive(NotificationCenter.default.publisher(for: .toggleCodexMenuRequested)) { notification in
-                if notification.object as? String == viewModel.screenIdentifier { expanded.toggle() }
+                if notification.object as? String == viewModel.screenIdentifier {
+                    keyboardPresentation = !expanded
+                    if keyboardPresentation { NSApp.activate(ignoringOtherApps: true) }
+                    expanded.toggle()
+                }
             }
             .popover(isPresented: $expanded, arrowEdge: .bottom) {
-                ActiveCodexList(dismiss: { expanded = false }, editing: { hover.setEditing($0) })
+                ActiveCodexList(dismiss: { expanded = false }, editing: { hover.setEditing($0) }, focusSearch: keyboardPresentation)
                     .modifier(NotchReveal())
                     .background(ActiveCodexList.surface)
                     .background(CodexMenuHoverRegion(hover: hover, isMenu: true))
@@ -411,7 +416,7 @@ struct ActiveCodexBadge: View {
                         viewModel.pinnedOpen = true
                     }
                     agents.refresh()
-                    hover.start()
+                    hover.start(keyboard: keyboardPresentation)
                 } else {
                     hover.stop()
                     if !viewModel.usesPhysicalCutout {
@@ -482,6 +487,7 @@ struct ActiveCodexList: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var dismiss: () -> Void = {}
     var editing: (Bool) -> Void = { _ in }
+    var focusSearch = false
     @State private var error: String?
     @State private var query = ""
     @FocusState private var searching: Bool
@@ -532,6 +538,7 @@ struct ActiveCodexList: View {
         .padding(9).frame(width: 340).background(Self.surface)
         .environment(\.colorScheme, .dark).accessibilityLabel("Чаты Codex")
         .onChange(of: searching) { _, value in editing(value) }
+        .onAppear { if focusSearch { DispatchQueue.main.async { searching = true } } }
         .onDisappear { editing(false) }
     }
 
