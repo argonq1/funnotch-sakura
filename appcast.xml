@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>FunNotch Sakura</title>
+        <link>https://github.com/argonq1/funnotch-sakura</link>
+        <description>Signed updates for FunNotch Sakura</description>
+        <language>en</language>
+        <item>
+            <title>1.11.0</title>
+            <pubDate>Thu, 19 Nov 2026 10:26:38 +0300</pubDate>
+            <link>https://github.com/argonq1/funnotch-sakura</link>
+            <sparkle:version>59</sparkle:version>
+            <sparkle:shortVersionString>1.11.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/argonq1/funnotch-sakura/releases/download/v1.11.0/FunNotch-1.11.0.dmg" length="5658054" type="application/octet-stream" sparkle:edSignature="m0iJccQqZqlwqBurhdwCJTs96dKYtmuQshv8yiijbjx5wWtGp8xA7Pxm8qa5DXskTtTUjb/cWxnizregfuGsCw=="/>
+        </item>
+    </channel>
+</rss>

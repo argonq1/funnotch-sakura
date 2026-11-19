@@ -1,0 +1,574 @@
+//
+//  NotchViewModel.swift
+//  FunNotch
+//
+//  One instance backs one notch window. It owns the open/closed state, the
+//  measured geometry for its display, and the transient "sneak peek" and HUD
+//  overlays that the collapsed notch shows.
+//
+
+import AppKit
+import Combine
+import SwiftUI
+
+/// A transient message shown in the collapsed notch (track change, HUD, …).
+struct SneakPeek: Equatable {
+    var show: Bool = false
+    var type: SneakContentType = .none
+    var value: CGFloat = 0
+    var icon: String = ""
+    /// Identity of this particular announcement. A new one replays the
+    /// entrance; repeated volume presses keep the same one, so the HUD reacts
+    /// to each press instead of starting over.
+    var token = UUID()
+}
+
+/// What the agents are up to, as far as the collapsed notch cares.
+struct AgentActivity: Equatable {
+    var active = 0
+    var waiting = false
+    var codexNames: [String] = []
+}
+
+/// How a working agent is shown beside the cutout.
+enum AgentPresentation {
+    case none
+    /// A small light at the inner edge of the right wing, beside whatever
+    /// else is there.
+    case pip
+    /// Nothing else is beside the cutout, so the agent gets both wings.
+    case wings
+}
+
+@MainActor
+final class NotchViewModel: ObservableObject {
+    /// Identifier of the display this notch is pinned to.
+    let screenIdentifier: String
+
+    @Published private(set) var notchState: NotchState = .closed
+    @Published var currentTab: NotchTab = .home
+
+    /// Collapsed measurements for this display.
+    @Published var closedNotchSize: CGSize = CGSize(width: 185, height: 32)
+
+    /// True while the pointer is inside the notch's hover region.
+    @Published var isHovering: Bool = false
+
+    /// A drag is in flight somewhere on screen, so the notch offers a drop target.
+    @Published var dragDetectorTargeting: Bool = false
+    @Published var isDropTargeted: Bool = false
+
+    /// Hidden because fullscreen media is playing on this display.
+    @Published var hiddenForFullscreen: Bool = false
+
+    @Published var sneakPeek = SneakPeek()
+    @Published var expandingView = SneakPeek()
+    @Published private(set) var codexCompletion: AgentSessionsManager.Announcement?
+    @Published private(set) var codexCompletionCount = 0
+    private var completionQueue: [AgentSessionsManager.Announcement] = []
+
+    /// Set while the notch should refuse to close (menus, popovers, drags).
+    @Published var pinnedOpen: Bool = false {
+        didSet {
+            guard pinnedOpen != oldValue else { return }
+            if pinnedOpen { cancelPendingClose() }
+            else { scheduleCloseIfNeeded() }
+        }
+    }
+
+    private var hoverWorkItem: DispatchWorkItem?
+    private var closeWorkItem: DispatchWorkItem?
+    private var closeToken: UUID?
+    private var sneakPeekWorkItem: DispatchWorkItem?
+    private var expandingViewWorkItem: DispatchWorkItem?
+    private var codexCompletionWorkItem: DispatchWorkItem?
+    private var cancellables = Set<AnyCancellable>()
+
+    private let settings = Settings.shared
+
+    /// True when the collapsed notch should widen to show album art and the
+    /// spectrum on either side of the hardware cutout.
+    @Published private(set) var showsMusicActivity = false
+
+    /// Mirrored from the focus manager so geometry can react to it.
+    @Published private(set) var focusIsActive = false
+
+    /// What the on-screen widgets reported they need, per side.
+    @Published private(set) var measuredWidgetWidths: [NotchSide: CGFloat] = [:]
+
+    /// Mirrored from the agent sessions manager so geometry can react to it.
+    @Published private(set) var agentActivity = AgentActivity()
+
+    init(screen: NSScreen?) {
+        screenIdentifier = screen?.displayIdentifier ?? ""
+        closedNotchSize = measureClosedNotch(for: screen)
+
+        NotificationCenter.default.publisher(for: .notchGeometryChanged)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshGeometry() }
+            .store(in: &cancellables)
+
+        MusicManager.shared.$track
+            .receive(on: RunLoop.main)
+            .sink { [weak self] track in
+                guard let self else { return }
+                let shouldShow = !track.isEmpty
+                guard shouldShow != self.showsMusicActivity else { return }
+                withAnimation(.notchContent) { self.showsMusicActivity = shouldShow }
+            }
+            .store(in: &cancellables)
+
+        AgentSessionsManager.shared.$sessions
+            .receive(on: RunLoop.main)
+            .sink { [weak self] sessions in
+                guard let self else { return }
+                let next = AgentActivity(
+                    active: sessions.filter(\.status.isActive).count,
+                    waiting: sessions.contains(where: \.status.isWaiting),
+                    codexNames: sessions.filter { $0.agent == .codex && $0.status.isActive }.map(\.name)
+                )
+                guard next != self.agentActivity else { return }
+                withAnimation(.notchContent) { self.agentActivity = next }
+            }
+            .store(in: &cancellables)
+
+        FocusManager.shared.$isActive
+            .receive(on: RunLoop.main)
+            .sink { [weak self] active in
+                guard let self, self.focusIsActive != active else { return }
+                withAnimation(.notchContent) { self.focusIsActive = active }
+                // Starting a session while the game is open would otherwise
+                // leave it running behind a tab that no longer exists.
+                if active, self.currentTab == .game {
+                    FocusTabState.shared.page = .countdown
+                    withAnimation(.notchContent) { self.currentTab = .focus }
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    var screen: NSScreen? {
+        NSScreen.screen(withIdentifier: screenIdentifier) ?? NSScreen.main
+    }
+
+    func refreshGeometry() {
+        closedNotchSize = measureClosedNotch(for: screen)
+    }
+
+    // MARK: - Open / close
+
+    func open() {
+        guard notchState == .closed else { return }
+        cancelPendingClose()
+        withAnimation(.notchOpen) {
+            notchState = .open
+        }
+        if settings.openShelfByDefault, settings.shelfEnabled, dragDetectorTargeting {
+            currentTab = .shelf
+        }
+        performHaptic()
+        // Clicks and programmatic opens need a close deadline even when no
+        // preceding mouse-enter event reached the nonactivating panel.
+        scheduleCloseIfNeeded()
+    }
+
+    func close() {
+        guard notchState == .open else { return }
+        guard !pinnedOpen else { return }
+        cancelPendingClose()
+        withAnimation(.notchClose) {
+            notchState = .closed
+        }
+        // Reset back to the default tab so the next open is predictable,
+        // unless the user has asked for the last tab to be remembered.
+        if !settings.rememberLastTab {
+            currentTab = .home
+        }
+        sneakPeek.show = false
+    }
+
+    func toggle() {
+        notchState == .open ? close() : open()
+    }
+
+    // MARK: - Hover driven behaviour
+
+    /// Called by the mouse tracker whenever the pointer enters or leaves the
+    /// notch's active region.
+    func setHovering(_ hovering: Bool) {
+        guard isHovering != hovering else {
+            if !hovering { scheduleCloseIfNeeded() }
+            return
+        }
+        isHovering = hovering
+
+        if hovering {
+            cancelPendingClose()
+            guard settings.openNotchOnHover, notchState == .closed else { return }
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.isHovering else { return }
+                self.open()
+            }
+            hoverWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + settings.minimumHoverDuration, execute: work)
+        } else {
+            hoverWorkItem?.cancel()
+            hoverWorkItem = nil
+            scheduleCloseIfNeeded()
+        }
+    }
+
+    private func scheduleCloseIfNeeded() {
+        guard notchState == .open, !isHovering, !pinnedOpen, closeWorkItem == nil else { return }
+        // Repeated outside samples must not move this deadline further out.
+        let token = UUID()
+        closeToken = token
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.closeToken == token else { return }
+            self.closeWorkItem = nil
+            self.closeToken = nil
+            guard !self.isHovering, !self.pinnedOpen else { return }
+            self.close()
+        }
+        closeWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+    }
+
+    /// Sets state directly, bypassing animation. Used by the snapshot renderer.
+    func setPreviewState(_ state: NotchState) {
+        notchState = state
+    }
+
+    /// Forces the music live activity on, for snapshots.
+    func setPreviewMusicActivity(_ visible: Bool) {
+        showsMusicActivity = visible
+    }
+
+    /// Forces the focus live activity on, for snapshots.
+    func setPreviewFocusActivity(_ active: Bool) {
+        focusIsActive = active
+    }
+
+    /// Forces the agent live activity, for snapshots.
+    func setPreviewAgentActivity(_ activity: AgentActivity) {
+        agentActivity = activity
+    }
+
+    private func cancelPendingClose() {
+        closeWorkItem?.cancel()
+        closeWorkItem = nil
+        closeToken = nil
+    }
+
+    private func performHaptic() {
+        guard settings.enableHaptics else { return }
+        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+    }
+
+    // MARK: - Transient overlays
+
+    /// Shows the compact "now playing" peek shown on track changes.
+    func showSneakPeek(type: SneakContentType, value: CGFloat = 0, icon: String = "", duration: Double? = nil) {
+        sneakPeekWorkItem?.cancel()
+        withAnimation(.smooth) {
+            sneakPeek = SneakPeek(show: true, type: type, value: value, icon: icon)
+        }
+        let work = DispatchWorkItem { [weak self] in
+            withAnimation(.smooth) { self?.sneakPeek.show = false }
+        }
+        sneakPeekWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (duration ?? settings.waitInterval), execute: work)
+    }
+
+    /// Shows the wider HUD strip used for volume / brightness / backlight.
+    func showExpandingView(type: SneakContentType, value: CGFloat, icon: String, duration: Double = 2.0) {
+        expandingViewWorkItem?.cancel()
+        var next = SneakPeek(show: true, type: type, value: value, icon: icon)
+        if type == .hud, expandingView.show, expandingView.type == .hud {
+            next.token = expandingView.token
+        }
+        withAnimation(.smooth) {
+            expandingView = next
+        }
+        let work = DispatchWorkItem { [weak self] in
+            withAnimation(.smooth) { self?.expandingView.show = false }
+        }
+        expandingViewWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+
+    // MARK: - Agent announcements
+
+    func showAgentAnnouncement(_ announcement: AgentSessionsManager.Announcement, duration: Double) {
+        if announcement.session.agent == .codex, case .finished = announcement.event {
+            guard showsCodexMenu, !hiddenForFullscreen else { return }
+            if codexCompletion != nil, !Motion.snapshotMode {
+                if !completionQueue.contains(where: { $0.session.id == announcement.session.id && $0.date == announcement.date }) {
+                    completionQueue.append(announcement)
+                    if completionQueue.count > 20 { completionQueue.removeFirst() }
+                    codexCompletionCount += 1
+                }
+                return
+            }
+            codexCompletion = announcement
+            codexCompletionCount = max(1, codexCompletionCount)
+            if expandingView.type == .agent { expandingView.show = false }
+            guard !Motion.snapshotMode else { return }
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.codexCompletion == announcement else { return }
+                self.codexCompletion = nil
+                self.codexCompletionWorkItem = nil
+                if !self.completionQueue.isEmpty {
+                    let next = self.completionQueue.removeFirst()
+                    self.showAgentAnnouncement(next, duration: CodexCompletionFlight.duration)
+                } else {
+                    self.codexCompletionCount = 0
+                }
+            }
+            codexCompletionWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + CodexCompletionFlight.duration, execute: work)
+            return
+        }
+        guard notchState == .closed else { return }
+        showExpandingView(type: .agent, value: 0, icon: "", duration: duration)
+    }
+
+    // MARK: - Derived geometry
+
+    /// Width added on each side of the cutout for the music live activity.
+    static let musicActivityInset: CGFloat = MusicPlayerImageSizes.size.closed.width + 12
+    /// Width the countdown needs beside the cutout.
+    static let focusActivityInset: CGFloat = 46
+    /// The agent light beside other activities, and its width with a count.
+    static let agentPipWidth: CGFloat = 32
+    static let agentPipWidthWithCount: CGFloat = 43
+    /// Each wing when a working agent has the cutout to itself.
+    static let agentWingInset: CGFloat = 46
+
+    var showsCodexMenu: Bool { settings.agentActivityEnabled }
+    var usesPhysicalCutout: Bool { !previewForceIsland && screen?.hasPhysicalNotch == true }
+
+    /// Fixed in the menu bar beside the camera, independent of panel size.
+    /// Coordinates use AppKit's bottom-left origin.
+    var codexBadgeRect: CGRect {
+        guard usesPhysicalCutout, showsCodexMenu, !hiddenForFullscreen else { return .zero }
+        let height: CGFloat = 26
+        return CGRect(x: (windowSize.width + closedNotchSize.width) / 2 + 4,
+                      y: windowSize.height - (closedNotchSize.height + height) / 2,
+                      width: 110, height: height)
+    }
+
+    var isRestingOnPhysicalCutout: Bool {
+        usesPhysicalCutout && notchState == .closed && !isShowingDropZone
+            && !isShowingStandardHUD && !isShowingStandardMusicPeek
+    }
+
+    /// The main panel sits beneath the menu bar on a display with a cutout.
+    var contentTopInset: CGFloat {
+        if usesPhysicalCutout && !isRestingOnPhysicalCutout { return closedNotchSize.height }
+        return islandTopGap
+    }
+
+    /// True when the announcement strip is showing below the cutout.
+    var isShowingStandardHUD: Bool {
+        expandingView.show && notchState == .closed
+    }
+
+    /// True when the notch is standing in as a drop target for a live drag.
+    /// A drag is an active gesture, so it outranks any transient HUD.
+    var isShowingDropZone: Bool {
+        notchState == .closed && dragDetectorTargeting && settings.shelfEnabled
+    }
+
+    /// True when the collapsed notch is carrying the focus countdown.
+    var showsFocusActivity: Bool {
+        focusIsActive && settings.focusShowInClosedNotch
+    }
+
+    /// True when the peek strip below the cutout is showing a track change.
+    var isShowingStandardMusicPeek: Bool {
+        sneakPeek.show && sneakPeek.type == .music && settings.sneakPeekStyle == .standard
+    }
+
+    /// The widgets to show beside the cutout right now, if any.
+    var activeWidgets: (leading: [NotchWidget], trailing: [NotchWidget]) {
+        guard notchState == .closed, settings.idleWidgetsEnabled else { return ([], []) }
+        return (settings.idleLeftWidgets, settings.idleRightWidgets)
+    }
+
+    /// Whether the artwork and spectrum take their places beside the cutout.
+    /// Something can be playing without them being drawn — the user may have
+    /// handed that space to the widgets instead.
+    var showsClosedMediaActivity: Bool {
+        showsMusicActivity && settings.closedMediaDisplay.showsMedia
+    }
+
+    /// Widgets only get the stage when nothing more urgent is using it — except
+    /// for music, where the user decides who yields.
+    var isShowingWidgets: Bool {
+        guard notchState == .closed else { return false }
+        guard !isShowingDropZone, !isShowingStandardHUD else { return false }
+        guard !isShowingStandardMusicPeek else { return false }
+
+        let widgets = activeWidgets
+        guard !widgets.leading.isEmpty || !widgets.trailing.isEmpty else { return false }
+
+        // A focus countdown still wins outright; it owns the right-hand side.
+        guard !showsFocusActivity else { return false }
+        guard showsMusicActivity else { return true }
+        return settings.closedMediaDisplay.showsWidgets
+    }
+
+    /// True when a Claude Code or Codex session is working or waiting.
+    var showsAgentActivity: Bool {
+        settings.agentActivityEnabled && agentActivity.active > 0
+    }
+
+    /// Where the agent light goes, given what else is beside the cutout.
+    var agentPresentation: AgentPresentation {
+        guard notchState == .closed, showsAgentActivity else { return .none }
+        guard agentActivity.active > agentActivity.codexNames.count else { return .none }
+        guard !isShowingDropZone, !isShowingStandardHUD, !isShowingStandardMusicPeek else { return .none }
+        let sidesTaken = isShowingWidgets || showsClosedMediaActivity || showsFocusActivity
+        return sidesTaken ? .pip : .wings
+    }
+
+    var agentPipWidth: CGFloat {
+        agentActivity.active > 1 ? Self.agentPipWidthWithCount : Self.agentPipWidth
+    }
+
+    /// Space taken beside the cutout by the live activities, left and right.
+    var closedActivityInsets: (leading: CGFloat, trailing: CGFloat) {
+        if isShowingDropZone { return (110, 110) }
+
+        var leading: CGFloat = 0
+        var trailing: CGFloat = 0
+
+        if showsClosedMediaActivity, !isShowingStandardMusicPeek {
+            leading = Self.musicActivityInset
+            trailing = Self.musicActivityInset
+        }
+
+        if showsFocusActivity {
+            // The countdown takes the right side; the left keeps the artwork,
+            // or picks up the focus glyph when nothing is playing.
+            trailing = Self.focusActivityInset
+            leading = max(leading, Self.musicActivityInset)
+        }
+
+        if isShowingWidgets {
+            let widgets = activeWidgets
+            // Prefer what the widget actually measured; the declared width is
+            // only a first guess for the very first layout pass. Added rather
+            // than assigned, so widgets sharing the row with the artwork and
+            // spectrum get their own space instead of overlapping them.
+            leading += widgets.leading.isEmpty
+                ? 0
+                : (measuredWidgetWidths[.leading] ?? Self.estimatedWidth(of: widgets.leading))
+            trailing += widgets.trailing.isEmpty
+                ? 0
+                : (measuredWidgetWidths[.trailing] ?? Self.estimatedWidth(of: widgets.trailing))
+        }
+
+        switch agentPresentation {
+        case .none:
+            break
+        case .pip:
+            trailing += agentPipWidth
+        case .wings:
+            leading = max(leading, Self.agentWingInset)
+            trailing = max(trailing, Self.agentWingInset)
+        }
+
+        return (leading, trailing)
+    }
+
+    /// Width of each wing of the collapsed notch. The notch is drawn centred
+    /// on the camera, so both wings take the wider side's width, and the
+    /// narrower side's content sits against the camera with black beyond it.
+    ///
+    /// The two sides used to be added together instead. Whenever they differed,
+    /// the gap left for the camera landed off-centre by half the difference,
+    /// and whatever sat against the camera on the wider side ended up under
+    /// it. Beside a clock and a battery, the working-agent light was hidden
+    /// that way.
+    var closedWingWidth: CGFloat {
+        let insets = closedActivityInsets
+        return max(insets.leading, insets.trailing)
+    }
+
+    private static func estimatedWidth(of widgets: [NotchWidget]) -> CGFloat {
+        widgets.reduce(0) { $0 + $1.estimatedWidth } + CGFloat(max(widgets.count - 1, 0)) * 12
+    }
+
+    /// Widths reported by the widgets currently on screen.
+    func updateMeasuredWidgetWidths(_ widths: [NotchSide: CGFloat]) {
+        let widgets = activeWidgets
+        var filtered = widths
+        if widgets.leading.isEmpty { filtered[.leading] = nil }
+        if widgets.trailing.isEmpty { filtered[.trailing] = nil }
+
+        guard filtered != measuredWidgetWidths else { return }
+        withAnimation(.notchContent) { measuredWidgetWidths = filtered }
+    }
+
+    /// Content size for the current state, excluding shadow padding.
+    var contentSize: CGSize {
+        switch notchState {
+        case .closed:
+            var size = closedNotchSize
+            if isRestingOnPhysicalCutout { return size }
+
+            if isShowingStandardHUD || isShowingStandardMusicPeek {
+                let style = isShowingStandardHUD ? LiveActivityMetrics.style(for: expandingView.type) : LiveActivityMetrics.banner
+                let cutoutWidth = usesPhysicalCutout ? 0 : closedNotchSize.width
+                size.width = max(cutoutWidth + style.wing * 2, style.minimumWidth)
+                size.height += style.chin
+                return size
+            }
+
+            if isShowingDropZone { size.height += 26 }
+            size.width += closedWingWidth * 2
+            return size
+
+        case .open:
+            guard currentTab == .game else { return openNotchSize }
+            return gameNotchSize
+        }
+    }
+
+    /// Development aid: `--render-preview` runs on whatever display this Mac
+    /// has, which is usually one with a notch, so island mode could never be
+    /// captured without this.
+    var previewForceIsland = false
+
+    /// True when this panel is floating on a display with no physical notch.
+    var isIsland: Bool {
+        guard settings.nonNotchStyle == .island else { return false }
+        if previewForceIsland { return true }
+        guard let screen else { return false }
+        return !screen.hasPhysicalNotch
+    }
+
+    /// How far the island sits below the top of the screen. Zero on a real
+    /// notch, where the panel is flush with the hardware.
+    var islandTopGap: CGFloat {
+        isIsland ? settings.islandTopGap : 0
+    }
+
+    var topCornerRadius: CGFloat {
+        notchState == .open ? cornerRadiusInsets.opened.top : cornerRadiusInsets.closed.top
+    }
+
+    var bottomCornerRadius: CGFloat {
+        notchState == .open ? cornerRadiusInsets.opened.bottom : cornerRadiusInsets.closed.bottom
+    }
+}
+
+extension Animation {
+    /// Spring used when the notch expands — slightly bouncy, like the reference.
+    static let notchOpen = Animation.spring(response: 0.48, dampingFraction: 0.82, blendDuration: 0.12)
+    /// Slightly faster and flatter on the way back in.
+    static let notchClose = Animation.spring(response: 0.30, dampingFraction: 0.92, blendDuration: 0.08)
+    static let notchContent = Animation.spring(response: 0.35, dampingFraction: 0.8)
+}

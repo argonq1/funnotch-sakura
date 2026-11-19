@@ -1,0 +1,108 @@
+//
+//  HomeGridView.swift
+//  FunNotch
+//
+//  Renders the home tab from the user's tile layout.
+//
+
+import SwiftUI
+
+struct HomeGridView: View {
+    @EnvironmentObject private var viewModel: NotchViewModel
+    @ObservedObject private var settings = Settings.shared
+    @ObservedObject private var music = MusicManager.shared
+    @ObservedObject private var focus = FocusManager.shared
+    @ObservedObject private var battery = BatteryManager.shared
+
+    var body: some View {
+        // Which whole layout applies right now.
+        let active = LayoutCaseResolver.active(settings: settings)
+        let tiles = (HomeLayout.filmTiles ?? settings.homeTiles(for: active) ?? settings.homeTiles).filter { $0.kind.isAvailable }
+        let top = HomeLayout.tiles(in: tiles, row: 0)
+        let bottom = HomeLayout.tiles(in: tiles, row: 1)
+
+        // Widths are arithmetic, not measurement. The open notch is a fixed
+        // 690 points wide with 22 of padding either side, so the row already
+        // knows how much space it has and nothing needs to ask.
+        //
+        // Both of the obvious alternatives were tried and both hung: a
+        // GeometryReader wants to fill a container that is sizing itself to its
+        // content, so the two waited on each other and SwiftUI recursed until
+        // it locked up; a custom Layout broke the recursion but then ground
+        // through hundreds of re-measurements of the album art and canvases.
+        Group {
+        if HomeLayout.isPosterDashboard(tiles) {
+            let total = CGFloat(max(tiles.reduce(0) { $0 + $1.span }, 1))
+            let weatherSpan = CGFloat(tiles.first(where: { $0.kind == .weather })?.span ?? 3)
+            HomeMediaPlayer(availableWidth: Self.rowWidth,
+                availableHeight: max(96, openNotchSize.height - max(viewModel.closedNotchSize.height, 30) - 30),
+                sidebarWidth: min(170, max(126, Self.rowWidth * weatherSpan / total)))
+        } else {
+        VStack(spacing: (top.isEmpty || bottom.isEmpty) ? 0 : 8) {
+            if !top.isEmpty {
+                row(top, spacing: 14)
+                    .frame(maxHeight: .infinity)
+            }
+            if !bottom.isEmpty {
+                row(bottom, spacing: 6)
+                    .frame(height: 46)
+            }
+        }
+        }
+        }
+        .padding(.top, 10)
+    }
+
+    /// Width available to a row inside the open notch.
+    private static let rowWidth = openNotchSize.width - 44
+
+    private func row(_ tiles: [HomeTile], spacing: CGFloat) -> some View {
+        let total = max(tiles.reduce(0) { $0 + CGFloat($1.span) }, 1)
+        let available = Self.rowWidth - spacing * CGFloat(max(tiles.count - 1, 0))
+        return HStack(alignment: .top, spacing: spacing) {
+            ForEach(tiles) { tile in
+                let width = max(available * CGFloat(tile.span) / total, 24)
+                HomeTileView(tile: tile, availableWidth: width)
+                    .frame(width: width)
+            }
+        }
+        .frame(width: Self.rowWidth, alignment: .leading)
+    }
+}
+
+/// One tile. Compact kinds get the strip's boxed chrome; large ones are drawn
+/// bare, because a box around the album art would be a box inside a box.
+struct HomeTileView: View {
+    let tile: HomeTile
+    var availableWidth: CGFloat = 337
+
+    var body: some View {
+        switch tile.kind {
+        case .nowPlaying:
+            HomeMediaPlayer(availableWidth: availableWidth)
+        case .weather:
+            WeatherPane()
+                .frame(height: tile.row == 0 ? 96 : 46)
+        case .calendar:
+            CalendarPane()
+        case .mirror:
+            MirrorPane()
+        case .agents:
+            if tile.row == 1 {
+                HomePanelChrome {
+                    AgentSessionsTile(compact: true)
+                }
+            } else {
+                AgentSessionsTile()
+            }
+        case .notes:
+            NotesView()
+        case .timer:
+            FocusView(isTile: true)
+        default:
+            HomePanelChrome {
+                HomeStripPanel(tile: tile)
+            }
+        }
+    }
+}

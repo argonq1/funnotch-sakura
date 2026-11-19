@@ -1,0 +1,202 @@
+//
+//  MouseTracker.swift
+//  FunNotch
+//
+//  The notch panel never becomes the active app, so AppKit will not deliver
+//  mouseEntered/mouseExited to it while another app has focus. Instead we watch
+//  pointer movement globally and decide hover state ourselves.
+//
+
+import AppKit
+
+@MainActor
+final class MouseTracker {
+    static let shared = MouseTracker()
+
+    /// Called with the current pointer location, in global screen coordinates.
+    var onMove: ((CGPoint) -> Void)?
+    /// Called with the click location for taps on the notch.
+    var onClick: ((CGPoint) -> Void)?
+    /// Called when a file drag starts or ends anywhere on screen.
+    var onDragStateChange: ((Bool) -> Void)?
+
+    /// Extra pointer observers. `onMove` belongs to the window manager; anything
+    /// else that needs the global pointer — the notch game's paddle — registers
+    /// here rather than fighting over that one slot.
+    private var moveObservers: [String: (CGPoint) -> Void] = [:]
+
+    private var monitors: [Any] = []
+    private var isRunning = false
+    private var positionPollTimer: Timer?
+    private var isDragging = false
+    /// Drag pasteboard generation at the last mouse-down. A real drag bumps it,
+    /// which is how we tell a live drag from leftovers of an old one.
+    private var pasteboardMarker = 0
+    /// Runs only between mouse-down and mouse-up.
+    private var dragPollTimer: Timer?
+    /// The button went down in one of the app's own windows — Settings or
+    /// Customize — so whatever gets dragged is being rearranged there, not
+    /// brought to the shelf. Without this, dragging a widget in the editor
+    /// opened the notch's drop zone.
+    private var dragStartedInOwnWindow = false
+
+    private init() {}
+
+    func start() {
+        stop()
+        isRunning = true
+
+        let moveMask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged]
+
+        addMonitors(matching: moveMask) { [weak self] event in
+            self?.handleMove(event)
+        }
+
+        addMonitors(matching: [.leftMouseUp]) { [weak self] _ in
+            self?.endDrag()
+        }
+
+        addMonitors(matching: [.leftMouseDown]) { [weak self] event in
+            guard let self else { return }
+            // Only the local monitor's events carry a window; clicks in other
+            // apps arrive through the global one without.
+            self.dragStartedInOwnWindow = event.window?.styleMask.contains(.titled) ?? false
+            self.pasteboardMarker = NSPasteboard(name: .drag).changeCount
+            self.startDragPolling()
+            self.onClick?(NSEvent.mouseLocation)
+        }
+    }
+
+    func stop() {
+        isRunning = false
+        positionPollTimer?.invalidate()
+        positionPollTimer = nil
+        for monitor in monitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        monitors.removeAll()
+        stopDragPolling()
+    }
+
+    /// Native menus, web views and nonactivating panels can swallow movement
+    /// events. Reconcile the actual pointer only while a notch is expanded.
+    /// Collapsed notches keep the event-driven path with no polling timer.
+    func setPositionPolling(_ enabled: Bool) {
+        guard enabled, isRunning else {
+            positionPollTimer?.invalidate()
+            positionPollTimer = nil
+            return
+        }
+        guard positionPollTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.samplePointer() }
+        }
+        timer.tolerance = 0.05
+        positionPollTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        samplePointer()
+    }
+
+    // MARK: - Drag detection
+    //
+    // Once AppKit starts a drag session it runs its own event loop, and global
+    // monitors stop seeing `leftMouseDragged` entirely. Polling the pressed
+    // buttons and the drag pasteboard is the only way to notice a drag that is
+    // already under way — and it needs no special permissions.
+
+    private func startDragPolling() {
+        guard dragPollTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pollDrag() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        dragPollTimer = timer
+    }
+
+    private func stopDragPolling() {
+        dragPollTimer?.invalidate()
+        dragPollTimer = nil
+    }
+
+    private func pollDrag() {
+        // Bit 0 is the left button.
+        guard NSEvent.pressedMouseButtons & 1 != 0 else {
+            endDrag()
+            return
+        }
+
+        guard !isDragging, !dragStartedInOwnWindow, Settings.shared.expandedDragDetection else { return }
+
+        let pasteboard = NSPasteboard(name: .drag)
+        guard pasteboard.changeCount != pasteboardMarker,
+              Self.pasteboardHasAcceptableContent(pasteboard)
+        else { return }
+
+        isDragging = true
+        DiagnosticLog.write(
+            "drag",
+            "poll detected a drag, pasteboard types=\(pasteboard.types?.map(\.rawValue).prefix(4) ?? [])"
+        )
+        onDragStateChange?(true)
+    }
+
+    private func endDrag() {
+        stopDragPolling()
+        guard isDragging else { return }
+        isDragging = false
+        DiagnosticLog.write("drag", "drag ended")
+        onDragStateChange?(false)
+    }
+
+    /// Called by the drop target when AppKit tells us a drag arrived that we
+    /// had not noticed, so the flag still gets cleared on mouse-up.
+    func noteDragInProgress() {
+        guard !isDragging else { return }
+        isDragging = true
+        pasteboardMarker = -1
+        startDragPolling()
+    }
+
+    private func addMonitors(matching mask: NSEvent.EventTypeMask, handler: @escaping (NSEvent) -> Void) {
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { event in
+            MainActor.assumeIsolated { handler(event) }
+        }) {
+            monitors.append(global)
+        }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { event in
+            MainActor.assumeIsolated { handler(event) }
+            return event
+        }) {
+            monitors.append(local)
+        }
+    }
+
+    func addMoveObserver(_ key: String, _ body: @escaping (CGPoint) -> Void) {
+        moveObservers[key] = body
+    }
+
+    func removeMoveObserver(_ key: String) {
+        moveObservers.removeValue(forKey: key)
+    }
+
+    private func handleMove(_ event: NSEvent) {
+        samplePointer()
+    }
+
+    private func samplePointer() {
+        let location = NSEvent.mouseLocation
+        onMove?(location)
+        for observer in moveObservers.values {
+            observer(location)
+        }
+    }
+
+    static func pasteboardHasAcceptableContent(_ pasteboard: NSPasteboard) -> Bool {
+        guard let types = pasteboard.types else { return false }
+        let accepted: Set<NSPasteboard.PasteboardType> = [
+            .fileURL, .URL, .string, .tiff, .png, .pdf, .rtf,
+            NSPasteboard.PasteboardType("public.file-url"),
+        ]
+        return !accepted.isDisjoint(with: Set(types))
+    }
+}

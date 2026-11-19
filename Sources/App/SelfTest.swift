@@ -1,0 +1,1581 @@
+//
+//  SelfTest.swift
+//  FunNotch
+//
+//  Development aid: `FunNotch --self-test` drives the real window manager,
+//  managers and pointer routing, prints what it found, and exits non-zero if
+//  anything essential is broken. Handy on a machine without Xcode.
+//
+
+import AppKit
+import AVFoundation
+import Foundation
+import QuartzCore
+
+@MainActor
+enum SelfTest {
+    static var isRequested: Bool {
+        CommandLine.arguments.contains("--self-test")
+    }
+
+    /// `FunNotch --diagnostics` prints the same report the Diagnostics pane
+    /// shows, so "is it broken or is it a permission?" can be answered from a
+    /// terminal without opening a window.
+    static var diagnosticsRequested: Bool {
+        CommandLine.arguments.contains("--diagnostics")
+    }
+
+    static func printDiagnostics() {
+        let report = DiagnosticsReport.shared
+        report.refresh()
+        print(report.plainText)
+        // Returning here would only fall back into `NSApplication.run()`, and
+        // an accessory app with no windows never comes back out of it.
+        exit(0)
+    }
+
+    /// `--check-file <path>` reports exactly what the app can see of a file, so
+    /// a silent rejection in the shelf can be traced to file access.
+    static var fileToCheck: String? {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--check-file"), index + 1 < arguments.count else {
+            return nil
+        }
+        return arguments[index + 1]
+    }
+
+    static func checkFile(_ path: String) {
+        let url = URL(fileURLWithPath: path)
+        print("=== file access check ===")
+        print("path: \(path)")
+        print("fileExists: \(FileManager.default.fileExists(atPath: path))")
+        print("isReadableFile: \(FileManager.default.isReadableFile(atPath: path))")
+
+        do {
+            let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentTypeKey])
+            print("size: \(values.fileSize ?? -1)")
+            print("type: \(values.contentType?.identifier ?? "unknown")")
+        } catch {
+            print("resourceValues failed: \(error.localizedDescription)")
+        }
+
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            let head = try handle.read(upToCount: 8)
+            try handle.close()
+            print("first bytes readable: \(head?.count ?? 0)")
+        } catch {
+            print("open for reading failed: \(error.localizedDescription)")
+        }
+
+        print("startAccessingSecurityScopedResource: \(url.startAccessingSecurityScopedResource())")
+
+        do {
+            _ = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+            print("security-scoped bookmark: ok")
+        } catch {
+            print("security-scoped bookmark failed: \(error.localizedDescription)")
+        }
+
+        do {
+            _ = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+            print("plain bookmark: ok")
+        } catch {
+            print("plain bookmark failed: \(error.localizedDescription)")
+        }
+
+        let added = ShelfManager.shared.add(url: url)
+        print("ShelfManager.add: \(added), shelf now holds \(ShelfManager.shared.items.count)")
+        if added, let item = ShelfManager.shared.items.first(where: { $0.url == url }) {
+            ShelfManager.shared.remove(id: item.id)
+        }
+        exit(0)
+    }
+
+    private static var failures: [String] = []
+    /// Puts back any preference the test changed.
+    private static var restoreSettings: (() -> Void)?
+
+    private static func check(_ name: String, _ condition: Bool, detail: String = "") {
+        let mark = condition ? "PASS" : "FAIL"
+        let suffix = detail.isEmpty ? "" : "  (\(detail))"
+        print("[\(mark)] \(name)\(suffix)")
+        if !condition { failures.append(name) }
+    }
+
+    private static func info(_ name: String, _ value: String) {
+        print("[INFO] \(name): \(value)")
+    }
+
+    static func run() {
+        // Unbuffered, so a crash mid-test still shows how far it got.
+        setvbuf(stdout, nil, _IONBF, 0)
+        print("=== Fun Notch self test ===")
+        info("launched by LaunchServices", "\(getppid() == 1)")
+
+        // MARK: Geometry
+        guard let screen = NSScreen.main else {
+            print("[FAIL] no main screen")
+            exit(1)
+        }
+        info("display", "\(screen.localizedName) \(Int(screen.frame.width))x\(Int(screen.frame.height))")
+        info("has physical notch", "\(screen.hasPhysicalNotch)")
+
+        let notch = measureClosedNotch(for: screen)
+        info("measured notch", "\(Int(notch.width)) x \(Int(notch.height))")
+        check("notch measurement is plausible", notch.width > 100 && notch.height > 10)
+
+        // Every tab has to fit to the left of the camera. Past its edge a tab
+        // is under the camera housing, invisible and unclickable, which is
+        // where the Game tab spent a while.
+        let allTabs = NotchTab.allCases.count
+        let tabWidth = NotchHeader.tabWidth(count: allTabs, cutoutWidth: notch.width)
+        let tabRow = tabWidth * CGFloat(allTabs) + NotchHeader.tabSpacing * CGFloat(allTabs - 1)
+        let tabRoom = (openNotchSize.width - 44 - notch.width) / 2
+        check(
+            "all \(allTabs) tabs fit beside the camera",
+            tabRow <= tabRoom && tabWidth >= 24,
+            detail: "\(Int(tabRow)) of \(Int(tabRoom)) pt, \(Int(tabWidth)) pt each"
+        )
+
+        // MARK: Managers
+        MusicManager.shared.start()
+        BatteryManager.shared.start()
+        CalendarManager.shared.start()
+        ScreenshotWatcher.shared.start()
+        ClipboardManager.shared.start()
+
+        // Touching IOBluetooth is a hard TCC kill unless the *responsible*
+        // process carries the usage string. Launched through LaunchServices
+        // that is this app; exec'd straight from a shell it is the shell, which
+        // has no such key. The Info.plist checks below are what actually guard
+        // against the missing-key regression.
+        // Reparented to launchd means LaunchServices started us; a shell
+        // parent means the shell is TCC-responsible and Bluetooth would abort.
+        let launchedByLaunchServices = getppid() == 1
+        if launchedByLaunchServices {
+            BluetoothMonitor.shared.start()
+        } else {
+            info("Bluetooth", "skipped — run from a shell, so this process is not TCC-responsible")
+        }
+
+        NotchWindowManager.shared.start()
+
+        let manager = NotchWindowManager.shared
+        check("a notch panel was created", !manager.controllers.isEmpty)
+        guard let controller = manager.controllers.first else {
+            finish()
+            return
+        }
+
+        let panel = controller.panel
+        info("panel frame", "\(panel.frame)")
+        check("panel is on screen", panel.isVisible)
+        info("panel level", "\(panel.level.rawValue)")
+        check("panel sits above the menu bar", panel.level.rawValue > NSWindow.Level.mainMenu.rawValue)
+        check(
+            "panel is not at an unusable level for drags",
+            panel.level.rawValue < NSWindow.Level.screenSaver.rawValue
+        )
+        check(
+            "panel is horizontally centred",
+            abs(panel.frame.midX - screen.frame.midX) < 1,
+            detail: "panel \(panel.frame.midX) vs screen \(screen.frame.midX)"
+        )
+        check(
+            "panel is flush with the top of the display",
+            abs(panel.frame.maxY - screen.frame.maxY) < 1
+        )
+
+        checkDragPlumbing(panel, notchHeight: notch.height, phase: "immediately")
+
+        let requiredUsageKeys = [
+            "NSBluetoothAlwaysUsageDescription": "Bluetooth",
+            "NSCameraUsageDescription": "the camera mirror",
+            "NSCalendarsUsageDescription": "the calendar",
+            "NSRemindersUsageDescription": "reminders",
+            "NSAppleEventsUsageDescription": "controlling Music, Spotify and browsers",
+        ]
+        for (key, purpose) in requiredUsageKeys.sorted(by: { $0.key < $1.key }) {
+            let value = Bundle.main.object(forInfoDictionaryKey: key) as? String
+            check(
+                "Info.plist explains \(purpose)",
+                !(value ?? "").isEmpty,
+                detail: key
+            )
+        }
+
+        // MARK: System state
+        info("battery", "\(BatteryManager.shared.percentageText), plugged in: \(BatteryManager.shared.isPluggedIn)")
+
+        // A Mac mini, Studio or Pro has no battery, and neither does a CI
+        // runner. Asserting one exists made the suite fail on perfectly healthy
+        // desktops. What actually matters is that the manager agrees with
+        // itself: if it says there is a battery, it has to report a level.
+        if BatteryManager.shared.hasBattery {
+            check(
+                "battery level is readable",
+                (0 ... 1).contains(BatteryManager.shared.level),
+                detail: BatteryManager.shared.percentageText
+            )
+        } else {
+            info("battery", "none on this Mac — desktop or VM, battery checks skipped")
+        }
+
+
+        info("Now Playing deprecated on this OS", "\(MusicManager.shared.isNowPlayingDeprecated)")
+        info("selected media backend", Settings.shared.mediaController.rawValue)
+        info("active media backend", MusicManager.shared.activeControllerType?.rawValue ?? "none")
+        info("Music running", "\(AppleScriptRunner.isRunning("com.apple.Music"))")
+        info("Spotify running", "\(AppleScriptRunner.isRunning("com.spotify.client"))")
+
+        for type in MediaControllerType.allCases where type != .nowPlaying {
+            info("\(type.rawValue) installed", "\(ScriptedMediaController.isInstalled(type))")
+        }
+        for result in ScriptedMediaController.validateScripts() {
+            check(
+                "\(result.type.rawValue) AppleScript compiles",
+                result.error == nil,
+                detail: result.error ?? ""
+            )
+        }
+
+        info("camera permission", "\(AVCaptureDevice.authorizationStatus(for: .video).rawValue)")
+
+        // MARK: Shelf round trip
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("funnotch-selftest.txt")
+        try? "shelf round trip".write(to: scratch, atomically: true, encoding: .utf8)
+        let before = ShelfManager.shared.items.count
+        let added = ShelfManager.shared.add(url: scratch)
+        check("a file can be added to the shelf", added && ShelfManager.shared.items.count == before + 1)
+        if let item = ShelfManager.shared.items.first(where: { $0.url == scratch }) {
+            ShelfManager.shared.remove(id: item.id)
+        }
+        check("a file can be removed from the shelf", ShelfManager.shared.items.count == before)
+        try? FileManager.default.removeItem(at: scratch)
+
+        // MARK: Focus mode
+        check(
+            "blocklist matches the host itself",
+            FocusManager.isBlocked(host: "youtube.com", by: ["youtube.com"])
+        )
+        check(
+            "blocklist matches subdomains",
+            FocusManager.isBlocked(host: "m.youtube.com", by: ["youtube.com"])
+        )
+        check(
+            "blocklist ignores a www prefix in the entry",
+            FocusManager.isBlocked(host: "reddit.com", by: ["www.reddit.com"])
+        )
+        check(
+            "blocklist does not match unrelated hosts",
+            !FocusManager.isBlocked(host: "notyoutube.com", by: ["youtube.com"])
+        )
+        check(
+            "blocklist does not match a suffix that is not a subdomain",
+            !FocusManager.isBlocked(host: "evilyoutube.com", by: ["youtube.com"])
+        )
+        check(
+            "host is parsed out of a full URL",
+            FocusManager.host(of: "https://www.YouTube.com/watch?v=1") == "youtube.com",
+            detail: FocusManager.host(of: "https://www.YouTube.com/watch?v=1") ?? "nil"
+        )
+        info("browsers Focus can police", FocusManager.supportedInstalledBrowsers.joined(separator: ", "))
+
+        let savedBlocking = Settings.shared.focusBlockWebsites
+        Settings.shared.focusBlockWebsites = false
+        FocusManager.shared.start(minutes: 25)
+        check("a focus session starts", FocusManager.shared.isActive)
+        check(
+            "the session reports time remaining",
+            FocusManager.shared.remaining > 24 * 60,
+            detail: FocusManager.shared.remainingText
+        )
+        FocusManager.shared.extend(byMinutes: 5)
+        check("a session can be extended", FocusManager.shared.remaining > 29 * 60)
+        FocusManager.shared.stop()
+        check("a focus session stops", !FocusManager.shared.isActive)
+        Settings.shared.focusBlockWebsites = savedBlocking
+
+        // MARK: Focus history and the timer
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        func dayKey(_ back: Int) -> String {
+            FocusManager.dayKey(calendar.date(byAdding: .day, value: -back, to: today) ?? today)
+        }
+        let week = FocusManager.week(in: [dayKey(0): 600, dayKey(6): 60], endingOn: Date())
+        check("the week chart is seven days ending today",
+              week.count == 7 && week.last?.seconds == 600 && week.first?.seconds == 60)
+        check("a streak runs to yesterday until today has some focus",
+              FocusManager.streak(in: [dayKey(1): 1500, dayKey(2): 900, dayKey(4): 900], asOf: Date()) == 2)
+        check("today's focus adds to the streak",
+              FocusManager.streak(in: [dayKey(0): 300, dayKey(1): 1500, dayKey(2): 900], asOf: Date()) == 3)
+        check("lengths read naturally",
+              TimerManager.shortLength(90) == "1:30" && TimerManager.shortLength(300) == "5 min"
+                && TimerManager.shortLength(5400) == "1 h 30",
+              detail: [90.0, 300, 5400].map(TimerManager.shortLength).joined(separator: ", "))
+
+        let timer = TimerManager.shared
+        // Keeps the test's timers out of the real recent list.
+        timer.previewRecent = []
+        timer.start(seconds: 120)
+        check("the countdown starts", timer.isCountdownRunning)
+        timer.pauseCountdown()
+        check("pausing keeps the time left", !timer.isCountdownRunning && timer.remaining > 100)
+        timer.addTime(60)
+        check("a paused timer can be given more time", timer.remaining > 160)
+        timer.clearPreview()
+        check("the countdown resets cleanly", !timer.isActive)
+
+        // MARK: Home layout
+        //
+        // The layout lives in preferences as encoded strings. A round trip that
+        // silently dropped a field would reset everyone's home screen on the
+        // next launch, and they would have no idea why.
+        let sample = HomeTile(kind: .openApp, row: 1, span: 3, appPath: "/Applications/Safari.app")
+        let restored = HomeTile.decode(sample.encoded)
+        check("a home tile survives encoding",
+              restored?.kind == sample.kind && restored?.row == sample.row
+              && restored?.span == sample.span && restored?.appPath == sample.appPath,
+              detail: sample.encoded.replacingOccurrences(of: "\u{1F}", with: "|"))
+
+        let defaults = HomeLayout.default
+        let roundTripped = defaults.map(\.encoded).compactMap(HomeTile.decode)
+        check("the default layout survives encoding",
+              roundTripped.count == defaults.count
+              && zip(roundTripped, defaults).allSatisfy { $0.kind == $1.kind && $0.span == $1.span },
+              detail: "\(defaults.count) tiles")
+
+        check("every tile kind has a usable default span",
+              HomeTileKind.allCases.allSatisfy { $0.defaultSpan >= $0.minimumSpan },
+              detail: "\(HomeTileKind.allCases.count) kinds")
+
+        check("Home uses a full poster with compact weather and text stats, without a bottom strip",
+              HomeLayout.isPosterDashboard(defaults) && HomeLayout.tiles(in: defaults, row: 1).isEmpty)
+
+        // MARK: Notes
+        //
+        // The whole point of the notes tab is that it lands as a real file on
+        // the Desktop, so the round trip is worth asserting rather than
+        // assuming: the folder can be missing, or Desktop access unGranted.
+        let notes = NotesManager.shared
+        info("notes file", notes.fileURL.path)
+        let notesBefore = notes.text
+        notes.text = "self test note \(UUID().uuidString)"
+        notes.saveNow()
+        if let error = notes.saveError {
+            check("the note saved to the Desktop", false, detail: error)
+        } else {
+            let readBack = try? String(contentsOf: notes.fileURL, encoding: .utf8)
+            check(
+                "the note saved to the Desktop",
+                readBack == notes.text,
+                detail: notes.fileURL.deletingLastPathComponent().lastPathComponent + "/Notes.txt"
+            )
+        }
+        // The backup exists precisely so the Desktop copy can be lost, so it is
+        // worth asserting separately rather than trusting one write.
+        let backup = try? String(contentsOf: notes.backupURL(for: notes.day), encoding: .utf8)
+        check("the note is mirrored inside the app", backup == notes.text,
+              detail: notes.backupFolder.lastPathComponent)
+
+        notes.text = notesBefore
+        notes.saveNow()
+
+        // MARK: Screenshots, clipboard, Bluetooth
+        let shots = ScreenshotWatcher.screenshotDirectory()
+        info("screenshot folder", shots.path)
+        check(
+            "the screenshot folder exists",
+            FileManager.default.fileExists(atPath: shots.path),
+            detail: shots.path
+        )
+
+        let clipboard = ClipboardManager.shared
+        let clipBefore = clipboard.entries.count
+        let probe = NSPasteboard(name: .init("funnotch.selftest.clip"))
+        probe.clearContents()
+        probe.setString("self test clipboard entry", forType: .string)
+        check("a pasteboard round trip preserves text", probe.string(forType: .string) == "self test clipboard entry")
+        clipboard.injectPreviewEntries([(.text("self test entry"), "SelfTest")])
+        check("clipboard history accepts entries", clipboard.entries.count == 1)
+        if let entry = clipboard.entries.first {
+            check("a clipboard entry previews as its text", entry.preview == "self test entry")
+            clipboard.remove(entry)
+        }
+        check("a clipboard entry can be removed", clipboard.entries.isEmpty)
+        info("clipboard entries before the test", "\(clipBefore)")
+
+        info("paired Bluetooth devices", "\(BluetoothMonitor.shared.devices.count)")
+        for device in BluetoothMonitor.shared.devices.prefix(4) {
+            info("  \(device.name)", "\(device.isConnected ? "connected" : "idle") symbol=\(device.symbol)")
+        }
+
+        // MARK: Notch widgets
+        let settings = Settings.shared
+        let savedWidgets = (
+            idle: settings.idleWidgetsEnabled,
+            idleLeft: settings.idleLeftWidgets,
+            idleRight: settings.idleRightWidgets
+        )
+
+        let widgetModel = controller.viewModel
+        widgetModel.expandingView = SneakPeek()
+        widgetModel.sneakPeek = SneakPeek()
+        widgetModel.dragDetectorTargeting = false
+        widgetModel.setPreviewMusicActivity(false)
+        // A session working in Claude Code while this runs would otherwise
+        // claim the space these checks measure.
+        widgetModel.setPreviewAgentActivity(AgentActivity())
+
+        settings.idleWidgetsEnabled = false
+        let bareWidth = widgetModel.contentSize.width
+        check("with widgets off the notch matches the cutout", abs(bareWidth - notch.width) < 1)
+
+        settings.idleWidgetsEnabled = true
+        settings.idleLeftWidgets = [.clock]
+        settings.idleRightWidgets = [.battery]
+        check("widgets are shown when enabled", widgetModel.isShowingWidgets)
+        check(
+            "widgets keep the hardware cutout clear",
+            widgetModel.usesPhysicalCutout ? widgetModel.contentSize.width == bareWidth : widgetModel.contentSize.width > bareWidth,
+            detail: "\(Int(bareWidth)) → \(Int(widgetModel.contentSize.width))"
+        )
+
+        settings.idleRightWidgets = []
+        check(
+            "a side set to Nothing takes no room",
+            widgetModel.closedActivityInsets.trailing == 0
+        )
+        // Half the clock used to sit under the camera here.
+        check(
+            "and the other side's widgets still clear the camera",
+            widgetModel.usesPhysicalCutout ? widgetModel.contentSize.width == bareWidth :
+            abs(widgetModel.contentSize.width - widgetModel.closedNotchSize.width
+                - 2 * max(widgetModel.closedActivityInsets.leading, widgetModel.closedActivityInsets.trailing)) < 0.5,
+            detail: "notch \(Int(widgetModel.contentSize.width))"
+        )
+        settings.idleRightWidgets = [.battery]
+
+        // Who gets the row while music plays is the user's call.
+        let savedMediaDisplay = settings.closedMediaDisplay
+        let widgetsOnlyWidth = widgetModel.closedWingWidth
+
+        widgetModel.setPreviewMusicActivity(true)
+        settings.closedMediaDisplay = .mediaOnly
+        check("by default music takes the row from the widgets", !widgetModel.isShowingWidgets)
+        check("and the artwork and spectrum are drawn", widgetModel.showsClosedMediaActivity)
+        let mediaOnlyWidth = widgetModel.closedWingWidth
+
+        settings.closedMediaDisplay = .mediaAndWidgets
+        check("sharing shows both", widgetModel.isShowingWidgets && widgetModel.showsClosedMediaActivity)
+        check(
+            "sharing needs more room than either alone",
+            widgetModel.closedWingWidth > max(mediaOnlyWidth, widgetsOnlyWidth),
+            detail: "\(Int(mediaOnlyWidth)) / \(Int(widgetsOnlyWidth)) → \(Int(widgetModel.closedWingWidth))"
+        )
+
+        settings.closedMediaDisplay = .widgetsOnly
+        check("handing the row over hides the media", !widgetModel.showsClosedMediaActivity)
+        check("and leaves the widgets on their own", widgetModel.isShowingWidgets)
+        check(
+            "which is the same width as when nothing is playing",
+            abs(widgetModel.closedWingWidth - widgetsOnlyWidth) < 1
+        )
+
+        // A focus countdown still wins outright, whatever the media setting.
+        settings.closedMediaDisplay = .mediaAndWidgets
+        widgetModel.setPreviewFocusActivity(true)
+        check("a focus countdown still takes the row", !widgetModel.isShowingWidgets)
+        widgetModel.setPreviewFocusActivity(false)
+
+        settings.closedMediaDisplay = savedMediaDisplay
+        widgetModel.setPreviewMusicActivity(false)
+
+        // Measured widths must beat the declared estimate, or locales with
+        // longer clock formats would clip.
+        widgetModel.updateMeasuredWidgetWidths([.leading: 240, .trailing: 90])
+        check(
+            "a measured width overrides the declared one",
+            widgetModel.closedActivityInsets.leading == 240,
+            detail: "\(widgetModel.closedActivityInsets.leading)"
+        )
+        widgetModel.setPreviewMusicActivity(false)
+        widgetModel.updateMeasuredWidgetWidths([:])
+        settings.idleWidgetsEnabled = savedWidgets.idle
+        settings.idleLeftWidgets = savedWidgets.idleLeft
+        settings.idleRightWidgets = savedWidgets.idleRight
+
+        // MARK: New widgets and their click targets
+        info("CPU / memory / disk", "\(SystemStatsManager.shared.cpuText) / \(SystemStatsManager.shared.memoryText) / \(SystemStatsManager.shared.diskFreeText)")
+        SystemStatsManager.shared.refresh()
+        check(
+            "system stats read back in range",
+            SystemStatsManager.shared.memoryUsage > 0 && SystemStatsManager.shared.memoryUsage <= 1,
+            detail: SystemStatsManager.shared.memoryText
+        )
+        check("disk free space is known", SystemStatsManager.shared.diskFreeBytes > 0)
+        info("moon phase", "\(MoonPhase.name()) \(Int(MoonPhase.fraction() * 100))%")
+        check(
+            "moon phase stays in range",
+            (0 ... 1).contains(MoonPhase.fraction())
+        )
+        check(
+            "every widget declares a width",
+            NotchWidget.allCases.allSatisfy { $0.estimatedWidth > 0 }
+        )
+        info("location permission", "\(WeatherManager.shared.authorization.rawValue)")
+
+        // The weather's set pieces run on a schedule of their own; if the
+        // schedule broke they would simply never happen, which nobody notices.
+        check(
+            "a storm throws lightning within a minute",
+            PixelWeatherView.nextStrike(after: 5000).map { $0 - 5000 < 60 } ?? false
+        )
+        check(
+            "a clear night has a shooting star within a minute",
+            PixelWeatherView.nextMeteor(after: 5000).map { $0 - 5000 < 60 } ?? false
+        )
+        check(
+            "every weather code maps to a scene with its own label",
+            Set([0, 3, 45, 53, 63, 95, 73].map { WeatherScene.from(code: $0, isDay: true).label }).count == 7
+        )
+
+        // MARK: Meeting links
+        check(
+            "a Zoom link is found in event notes",
+            MeetingLinkFinder.find(in: ["Dial in at https://us02web.zoom.us/j/123456789 please"])?.host == "us02web.zoom.us"
+        )
+        check(
+            "a Meet link is found in the location field",
+            MeetingLinkFinder.find(in: [nil, "https://meet.google.com/abc-defg-hij"])?.host == "meet.google.com"
+        )
+        check(
+            "a Teams link is recognised",
+            MeetingLinkFinder.find(in: ["https://teams.microsoft.com/l/meetup-join/x"]) != nil
+        )
+        check(
+            "an ordinary link is not mistaken for a meeting",
+            MeetingLinkFinder.find(in: ["See https://example.com/agenda"]) == nil
+        )
+
+        // MARK: Browser media
+        info("browsers Fun Notch can read", BrowserMediaController.installedBrowsers.joined(separator: ", "))
+        check(
+            "a YouTube watch page counts as media",
+            BrowserMediaController.isMediaURL("https://www.youtube.com/watch?v=abc")
+        )
+        check(
+            "the YouTube front page does not",
+            !BrowserMediaController.isMediaURL("https://www.youtube.com/")
+        )
+        check(
+            "YouTube Music counts as media",
+            BrowserMediaController.isMediaURL("https://music.youtube.com/watch?v=abc")
+        )
+        check(
+            "the Spotify web player counts as media",
+            BrowserMediaController.isMediaURL("https://open.spotify.com/track/xyz")
+        )
+        check(
+            "an unrelated site does not",
+            !BrowserMediaController.isMediaURL("https://example.com/watch")
+        )
+        check(
+            "Browser is offered as a media backend",
+            MediaControllerType.allCases.contains(.browser)
+        )
+        check(
+            "a YouTube Music tab with nothing playing is not a track",
+            BrowserMediaController.isIdleTab(
+                url: "https://music.youtube.com/",
+                title: "YouTube Music"
+            )
+        )
+        check(
+            "an idle Spotify web player is not a track",
+            BrowserMediaController.isIdleTab(
+                url: "https://open.spotify.com/",
+                title: "Spotify - Web Player: Music for everyone"
+            )
+        )
+        check(
+            "a playing tab is still a track",
+            !BrowserMediaController.isIdleTab(
+                url: "https://music.youtube.com/watch?v=abc",
+                title: "Bohemian Rhapsody - Queen - YouTube Music"
+            )
+        )
+        check(
+            "artwork is derived from the YouTube video id",
+            BrowserMediaController.thumbnailURL(
+                forPageURL: "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42"
+            ) == "https://img.youtube.com/vi/dQw4w9WgXcQ/maxresdefault.jpg"
+        )
+        check(
+            "YouTube Music artwork uses the same thumbnail",
+            BrowserMediaController.thumbnailURL(
+                forPageURL: "https://music.youtube.com/watch?v=abc123"
+            ) == "https://img.youtube.com/vi/abc123/maxresdefault.jpg"
+        )
+        check(
+            "no thumbnail is invented for other sites",
+            BrowserMediaController.thumbnailURL(forPageURL: "https://open.spotify.com/track/xyz") == nil
+        )
+        check("short YouTube links and Shorts request a Retina poster",
+              BrowserMediaController.thumbnailURL(forPageURL: "https://youtu.be/abc_123-xyz?t=7") == "https://img.youtube.com/vi/abc_123-xyz/maxresdefault.jpg"
+              && BrowserMediaController.thumbnailURL(forPageURL: "https://www.youtube.com/shorts/abc123") == "https://img.youtube.com/vi/abc123/maxresdefault.jpg")
+        check("YouTube covers try the intermediate sizes before the small fallback",
+              BrowserMediaController.thumbnailURLs(forPageURL: "https://youtube.com/watch?v=abc123") == [
+                "https://img.youtube.com/vi/abc123/maxresdefault.jpg", "https://img.youtube.com/vi/abc123/sddefault.jpg",
+                "https://img.youtube.com/vi/abc123/hqdefault.jpg", "https://img.youtube.com/vi/abc123/mqdefault.jpg"
+              ] && BrowserMediaController.thumbnailURLs(forPageURL: "https://example.org/watch?v=abc123").isEmpty)
+        check("thumbnail URLs reject lookalike hosts and path injection",
+              BrowserMediaController.thumbnailURL(forPageURL: "https://youtube.com.example.org/watch?v=abc") == nil
+              && BrowserMediaController.thumbnailURL(forPageURL: "https://youtube.com/watch?v=..%2Fabc") == nil)
+        var sourceA = TrackInfo(); sourceA.title = "Same video title"
+        var sourceB = sourceA; sourceB.pageURL = URL(string: "https://youtube.com/watch?v=abc")
+        check("same-title videos still publish a changed source", sourceA != sourceB && sourceB.isYouTube)
+        sourceB.pageURL = URL(string: "https://youtube.com.example.org/watch?v=abc")
+        check("YouTube player branding uses an exact domain boundary", !sourceB.isYouTube)
+
+        let largeCover = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1920, pixelsHigh: 1080,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        largeCover.bitmapData?.initialize(repeating: 127, count: largeCover.bytesPerRow * largeCover.pixelsHigh)
+        let coverData = largeCover.representation(using: .png, properties: [:])!
+        let smallCover = MediaArtwork.decode(coverData)
+        check("full-HD artwork decodes directly into a bounded Retina poster",
+              smallCover?.representations.first?.pixelsWide == 1536 && smallCover?.representations.first?.pixelsHigh == 864)
+        check("the decoded wide poster holds at most six MiB of RGBA pixels",
+              smallCover.map { MediaArtwork.pixelCost($0) <= 6 * 1024 * 1024 } ?? false)
+        check("corrupt and oversized artwork fail without an image",
+              MediaArtwork.decode(Data("not an image".utf8)) == nil && MediaArtwork.decode(Data(count: MediaArtwork.maxEncodedBytes + 1)) == nil)
+
+        // MARK: HUD, sharing and the menu bar
+        info("display brightness control", DisplayBrightness.isAvailable ? "available" : "not exposed")
+        info("keyboard backlight control", KeyboardBacklight.isAvailable ? "available" : "not exposed")
+        info("system volume", SystemAudio.volume.map { "\(Int($0 * 100))%" } ?? "unreadable")
+        check("volume is readable through CoreAudio", SystemAudio.volume != nil)
+        check("AirDrop is offered by macOS", ShelfManager.canAirDrop)
+
+        // The HUD ships switched on, so "is it off by default" is no longer the
+        // property worth asserting. This is: it must never intercept a key
+        // before Accessibility has been granted, whatever the setting says.
+        check(
+            "the HUD never intercepts without Accessibility",
+            AXIsProcessTrusted() || !HUDManager.shared.isIntercepting
+        )
+        check(
+            "every HUD category can be switched independently",
+            [\Settings.hudShowsVolume, \Settings.hudShowsBrightness, \Settings.hudShowsBacklight]
+                .allSatisfy { Settings.shared[keyPath: $0] }
+        )
+        // Driving the strip must not need the hardware.
+        HUDManager.shared.injectPreview(.volume, value: 0.42)
+        check("a HUD reading reaches the notch", HUDManager.shared.showing == .volume)
+        check("and carries its value", abs(HUDManager.shared.value - 0.42) < 0.001)
+        HUDManager.shared.clearPreview()
+        check("and clears again", HUDManager.shared.showing == nil)
+
+        // MARK: Live activities
+        let stage = controller.viewModel
+        stage.setPreviewMusicActivity(false)
+        stage.setPreviewAgentActivity(AgentActivity())
+        stage.showExpandingView(type: .hud, value: 0.5, icon: HUDManager.Kind.volume.symbol, duration: 0.3)
+        let firstToken = stage.expandingView.token
+        let hudDrop = stage.contentSize.height - stage.closedNotchSize.height
+        check(
+            "the HUD drops only a sliver below the notch",
+            abs(hudDrop - LiveActivityMetrics.hud.chin) < 0.5 && hudDrop <= 16,
+            detail: "\(Int(hudDrop)) pt, was 34"
+        )
+        stage.showExpandingView(type: .hud, value: 0.56, icon: HUDManager.Kind.volume.symbol, duration: 0.3)
+        check("pressing again keeps the same HUD rather than restarting it", stage.expandingView.token == firstToken)
+        stage.showExpandingView(type: .battery, value: 0.8, icon: "battery.100.bolt", duration: 0.3)
+        check("a different announcement plays its own entrance", stage.expandingView.token != firstToken)
+        let bannerDrop = stage.contentSize.height - stage.closedNotchSize.height
+        check("announcements drop less than they used to", bannerDrop < 34, detail: "\(Int(bannerDrop)) pt, was 34")
+        stage.expandingView = SneakPeek()
+
+        // MARK: Agents
+        //
+        // Claude Code's registry is only ever read: whatever is running is
+        // reported, and nothing in it is touched.
+        let registry = AgentSessionsManager.readClaudeRegistry()
+        info("Claude Code sessions running", "\(registry.count)")
+        check(
+            "every registry session belongs to a live process",
+            registry.allSatisfy { ProcessInfoReader.isAlive($0.pid) }
+        )
+        check(
+            "every session has a name to show",
+            registry.allSatisfy { !$0.name.isEmpty && !$0.project.isEmpty }
+        )
+
+        let origin = Date(timeIntervalSince1970: 1_800_000_000)
+        func agentSession(_ status: AgentSessionsManager.Status, at offset: TimeInterval) -> AgentSessionsManager.Session {
+            AgentSessionsManager.Session(
+                id: "test", agent: .claude, name: "Test", project: "test", status: status,
+                statusSince: origin.addingTimeInterval(offset), turnStartedAt: nil, lastTurnDuration: nil,
+                startedAt: origin, pid: nil, host: .process
+            )
+        }
+        var opened = agentSession(.idle, at: 0)
+        check("a session that opens idle is not news", AgentSessionsManager.transition(from: nil, to: &opened).isEmpty)
+        var working = agentSession(.working, at: 10)
+        check("idle to busy is a start", AgentSessionsManager.transition(from: opened, to: &working) == [.started])
+        var asking = agentSession(.waiting("permission prompt"), at: 70)
+        check(
+            "busy to waiting asks for you",
+            AgentSessionsManager.transition(from: working, to: &asking) == [.needsInput("permission prompt")]
+        )
+        var resumed = agentSession(.working, at: 90)
+        check("answering it is not a second start", AgentSessionsManager.transition(from: asking, to: &resumed).isEmpty)
+        var finished = agentSession(.idle, at: 204)
+        let finishEvents = AgentSessionsManager.transition(from: resumed, to: &finished)
+        check(
+            "a turn is timed from its first message, pause included",
+            finishEvents == [.finished(194)],
+            detail: "\(finishEvents)"
+        )
+        check("and the time is kept on the session", finished.lastTurnDuration == 194)
+        let namedCodex = AgentSessionsManager.Session(
+            id: "codex:test-thread", agent: .codex, name: "Сделать змейку", project: "Mac", status: .idle,
+            statusSince: origin, turnStartedAt: nil, lastTurnDuration: 194, startedAt: origin, pid: nil, host: .codexApp
+        )
+        let namedFinish = AgentSessionsManager.announcementLine(.init(session: namedCodex, event: .finished(194), date: origin))
+        check("Codex finished identifies the chat", namedFinish.lead == "Codex finished" && namedFinish.detail == " · Сделать змейку")
+        let chatID = "00000000-0000-4000-8000-000000000001"
+        check("Codex opens the exact chat by its UUID", AgentSessionsManager.codexChatURL(for: "codex:" + chatID)?.absoluteString == "codex://threads/" + chatID)
+        check("invalid chat identities cannot create arbitrary links", AgentSessionsManager.codexChatURL(for: "codex:../settings") == nil && AgentSessionsManager.codexChatURL(for: "claude:" + chatID) == nil)
+        let codexEntries = AgentSessionsManager.readCodexRollouts(now: Date())
+        check("recent Codex chats have distinct session identities and display names",
+              Set(codexEntries.map(\.sessionID)).count == codexEntries.count && codexEntries.allSatisfy { !$0.name.isEmpty })
+        check(
+            "durations read naturally",
+            AgentSessionsManager.duration(194) == "3m 14s"
+                && AgentSessionsManager.duration(45) == "45s"
+                && AgentSessionsManager.duration(3900) == "1h 5m"
+        )
+        check(
+            "a working clock reads naturally",
+            AgentSessionsManager.clock(134) == "2:14" && AgentSessionsManager.clock(3725) == "1:02:05"
+        )
+        check(
+            "a waiting reason becomes a sentence",
+            AgentSessionsManager.waitingText("permission prompt") == "Needs your permission"
+        )
+        check(
+            "a folder with a space in it keeps its name",
+            AgentSessionsManager.projectName(for: "/Users/someone/untitled folder") == "untitled folder"
+        )
+
+        let savedAgentSettings = (
+            enabled: settings.agentActivityEnabled,
+            idle: settings.idleWidgetsEnabled,
+            left: settings.idleLeftWidgets,
+            right: settings.idleRightWidgets
+        )
+        settings.agentActivityEnabled = true
+        settings.idleWidgetsEnabled = false
+        let completionModel = NotchViewModel(screen: screen)
+        let completionNotice = AgentSessionsManager.Announcement(session: namedCodex, event: .finished(194), date: Date())
+        let completionSize = completionModel.contentSize
+        completionModel.showAgentAnnouncement(completionNotice, duration: 4.2)
+        check("Codex completion animates from the badge without opening a banner",
+              completionModel.codexCompletion == completionNotice && !completionModel.expandingView.show
+                && completionModel.notchState == .closed && completionModel.contentSize == completionSize)
+        completionModel.previewOpen()
+        let secondCompletion = AgentSessionsManager.Announcement(session: namedCodex, event: .finished(200), date: Date())
+        completionModel.showAgentAnnouncement(secondCompletion, duration: 4.2)
+        check("new Codex completions queue while the panel is open",
+              completionModel.codexCompletion == completionNotice && completionModel.codexCompletionCount == 2 && !completionModel.expandingView.show
+                && completionModel.notchState == .open)
+        let stoppedModel = NotchViewModel(screen: screen)
+        var stoppedCodex = namedCodex
+        stoppedCodex.wasInterrupted = true
+        stoppedModel.showAgentAnnouncement(.init(session: stoppedCodex, event: .finished(194), date: Date()), duration: 4)
+        check("an interrupted Codex turn keeps its stopped state for the badge animation",
+              stoppedModel.codexCompletion?.session.wasInterrupted == true && !stoppedModel.expandingView.show)
+        settings.agentActivityEnabled = false
+        let disabledModel = NotchViewModel(screen: screen)
+        disabledModel.showAgentAnnouncement(completionNotice, duration: 4.2)
+        check("disabled agent activity does not create a Codex completion animation",
+              disabledModel.codexCompletion == nil && !disabledModel.expandingView.show)
+        settings.agentActivityEnabled = true
+        stage.setPreviewAgentActivity(AgentActivity(active: 1, waiting: false))
+        check(
+            "a working agent takes both wings when nothing else is there",
+            stage.agentPresentation == .wings
+                && stage.closedActivityInsets.leading == NotchViewModel.agentWingInset
+        )
+        settings.idleWidgetsEnabled = true
+        settings.idleLeftWidgets = [.clock]
+        settings.idleRightWidgets = [.battery]
+        check("beside widgets it shrinks to a small light", stage.agentPresentation == .pip)
+        // The light goes on the right only, so the sides differ. The notch is
+        // drawn centred on the camera, so the wings must stay equal; when they
+        // were added together instead, the gap for the camera slid left and the
+        // light went under the camera housing.
+        let lightInsets = stage.closedActivityInsets
+        check(
+            "and the camera stays in the middle, so the light is not under it",
+            stage.usesPhysicalCutout ? stage.contentSize == stage.closedNotchSize :
+            abs(stage.contentSize.width - stage.closedNotchSize.width
+                - 2 * max(lightInsets.leading, lightInsets.trailing)) < 0.5,
+            detail: "sides \(Int(lightInsets.leading)) | \(Int(lightInsets.trailing)), notch \(Int(stage.contentSize.width))"
+        )
+        let withLight = stage.closedActivityInsets.trailing
+        stage.setPreviewAgentActivity(AgentActivity(active: 3, waiting: false,
+            codexNames: ["Сделать Flappy Bird", "Проверить курсовую", "Очень длинное название ещё одного работающего чата"]))
+        check("Codex has an independent menu without widening the closed notch", stage.agentPresentation == .none && stage.showsCodexMenu)
+        check("active chat names fit within the notch window", stage.contentSize.width <= openNotchSize.width + 0.5)
+        settings.idleWidgetsEnabled = false
+        check("Codex chat names claim no menu bar width", stage.closedActivityInsets.trailing == 0)
+        settings.idleWidgetsEnabled = true
+        stage.setPreviewAgentActivity(AgentActivity())
+        check(
+            "the Codex menu stays when the last task finishes",
+            stage.showsCodexMenu && stage.closedActivityInsets.trailing < withLight,
+            detail: "\(Int(withLight)) → \(Int(stage.closedActivityInsets.trailing))"
+        )
+        settings.agentActivityEnabled = savedAgentSettings.enabled
+        settings.idleWidgetsEnabled = savedAgentSettings.idle
+        settings.idleLeftWidgets = savedAgentSettings.left
+        settings.idleRightWidgets = savedAgentSettings.right
+
+        let driftLoop = DriftGame.shared
+        driftLoop.open()
+        check("Neon Drift's ready screen does not run a frame loop", !driftLoop.hasFrameTimer)
+        driftLoop.start()
+        check("Neon Drift starts its frame loop for a race", driftLoop.hasFrameTimer)
+        func sendDriveKey(_ code: UInt16, _ type: CGEventType, flags: CGEventFlags = []) -> Bool {
+            guard let key = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: type != .keyUp) else { return false }
+            key.type = type
+            key.flags = flags
+            guard let event = NSEvent(cgEvent: key) else { return false }
+            return driftLoop.handleKey(event)
+        }
+        let gasAccepted = sendDriveKey(13, .keyDown)
+        check("W activates the gas pedal on its own", gasAccepted && driftLoop.input.throttle && !driftLoop.input.nitro)
+        let shiftAccepted = sendDriveKey(56, .flagsChanged, flags: .maskShift)
+        check("Shift activates nitro with the gas pedal held", shiftAccepted && driftLoop.input.nitro && driftLoop.input.throttle)
+        let shiftReleased = sendDriveKey(56, .flagsChanged)
+        check("releasing Shift leaves the gas pedal engaged", shiftReleased && !driftLoop.input.nitro && driftLoop.input.throttle)
+        let gasReleased = sendDriveKey(13, .keyUp)
+        check("releasing W lifts the gas pedal", gasReleased && !driftLoop.input.throttle)
+        driftLoop.togglePause()
+        check("pausing Neon Drift stops its frame loop", !driftLoop.hasFrameTimer)
+        driftLoop.start(); driftLoop.close()
+        check("hiding Neon Drift stops its frame loop", !driftLoop.hasFrameTimer)
+
+        var orbitCentered = true
+        for size in [11.0, 13.0, 16.0] {
+            let orbit = OrbitLayerView(frame: NSRect(x: 0, y: 0, width: size, height: size))
+            for angle in [0.0, 40.0, 90.0, 145.0, 270.0] {
+                orbit.update(tint: .systemTeal, spinning: false, angle: angle)
+                orbit.layout()
+                for layer in orbit.layer?.sublayers ?? [] {
+                    guard let ring = layer as? CAShapeLayer, let path = ring.path else { orbitCentered = false; continue }
+                    let circle = path.boundingBoxOfPath
+                    orbitCentered = orbitCentered && abs(ring.bounds.width - size) < 0.001
+                        && abs(ring.bounds.height - size) < 0.001
+                        && abs(ring.position.x - size / 2) < 0.001 && abs(ring.position.y - size / 2) < 0.001
+                        && abs(circle.midX - size / 2) < 0.001 && abs(circle.midY - size / 2) < 0.001
+                }
+            }
+        }
+        check("the Codex arc stays centered through rotation and relayout", orbitCentered)
+        let animatedOrbit = OrbitLayerView(frame: NSRect(x: 0, y: 0, width: 13, height: 13))
+        animatedOrbit.update(tint: .systemTeal, spinning: true, angle: 40)
+        let spin = animatedOrbit.layer?.sublayers?.last?.animation(forKey: "orbit") as? CABasicAnimation
+        var control1: [Float] = [0, 0]
+        var control2: [Float] = [0, 0]
+        spin?.timingFunction?.getControlPoint(at: 1, values: &control1)
+        spin?.timingFunction?.getControlPoint(at: 2, values: &control2)
+        check("the Codex orbit rotates smoothly through one full turn", spin?.repeatCount == .infinity
+              && control1 == [0, 0] && control2 == [1, 1]
+              && (spin?.toValue as? Double) == -Double.pi * 2)
+        animatedOrbit.update(tint: .systemTeal, spinning: false, angle: 40)
+        check("the Codex orbit stops for reduced-motion or idle mode", animatedOrbit.layer?.sublayers?.last?.animation(forKey: "orbit") == nil)
+
+        check(
+            "the menu bar can be given a readout",
+            MenuBarReadout.allCases.count >= 5 && MenuBarGlyph.allCases.contains(.none)
+        )
+
+        // MARK: Sample agenda
+        //
+        // The dangerous failure here is not a missing placeholder, it is a
+        // placeholder that displaces or impersonates something real.
+        let sampleDay = Calendar.current.date(from: DateComponents(year: 2026, month: 8, day: 12))!
+        let samples = CalendarManager.sampleItems(for: sampleDay, includeReminders: true)
+        check("the sample agenda has something in it", !samples.isEmpty, detail: "\(samples.count) rows")
+        check("every sample row is flagged as one", samples.allSatisfy(\.isSample))
+        check(
+            "sample times land on the day being viewed",
+            samples.compactMap(\.start).allSatisfy { Calendar.current.isDate($0, inSameDayAs: sampleDay) }
+        )
+        check(
+            "sample reminders follow the reminders setting",
+            CalendarManager.sampleItems(for: sampleDay, includeReminders: false)
+                .allSatisfy { !$0.isReminder }
+        )
+
+        let realItem = AgendaItem(
+            id: "real", title: "Standup", start: sampleDay, end: nil, isAllDay: false,
+            calendarColor: .blue, calendarTitle: "Work", kind: .event,
+            location: nil, externalIdentifier: nil, meetingURL: nil
+        )
+        check(
+            "a day with a real event is left alone",
+            CalendarManager.fillingIfEmpty([realItem], enabled: true, day: sampleDay, includeReminders: true)
+                == [realItem]
+        )
+        check(
+            "an empty day is only filled when the setting is on",
+            CalendarManager.fillingIfEmpty([], enabled: false, day: sampleDay, includeReminders: true).isEmpty
+        )
+        check(
+            "samples never become your next event",
+            CalendarManager.next(in: samples, now: sampleDay) == nil
+        )
+        check(
+            "but a real event still does",
+            CalendarManager.next(in: samples + [realItem], now: sampleDay)?.id == "real"
+        )
+        // Toggling the setting has to rebuild the agenda. Without this the
+        // switch appears to do nothing until the next minute tick.
+        check(
+            "toggling the setting rebuilds the agenda",
+            CalendarManager.reloadTriggeringKeys.contains("showSampleAgenda")
+        )
+
+        // Sharing falls back to the whole shelf when nothing is ticked.
+        ShelfManager.shared.selection.removeAll()
+        check(
+            "sharing with no selection means the whole shelf",
+            ShelfManager.shared.shareURLs.count == ShelfManager.shared.items.count
+        )
+
+        // MARK: Diagnostics
+        // Every row queries a different permission API, so building the report
+        // at all is the check that none of them trap on a fresh machine.
+        let report = DiagnosticsReport.shared
+        report.refresh()
+        check("the diagnostics report has every section", report.sections.count == 5)
+        // The bug that hid for the whole project was an AppleScript error that
+        // nothing recorded, so check the recording works.
+        ScriptErrors.record(
+            source: "tell application \"Google Chrome\"\nreturn 1\nend tell",
+            message: "test failure"
+        )
+        check(
+            "a script failure is attributed to the app that refused it",
+            ScriptErrors.current.contains { $0.application == "Google Chrome" && $0.message == "test failure" }
+        )
+        ScriptErrors.clear(application: "Google Chrome")
+        check(
+            "and cleared once it works again",
+            !ScriptErrors.current.contains { $0.application == "Google Chrome" }
+        )
+        check(
+            "an Automation refusal says where to fix it",
+            DiagnosticsReport.shared.sections.count == 5
+        )
+        check("every row says something", report.sections.allSatisfy { section in
+            !section.rows.isEmpty && section.rows.allSatisfy { !$0.verdict.text.isEmpty }
+        })
+        check(
+            "the report can be copied as text",
+            report.plainText.contains("Fun Notch diagnostics") && report.plainText.count > 200
+        )
+        info("diagnostics rows", "\(report.sections.reduce(0) { $0 + $1.rows.count })")
+
+        // MARK: Turning on page access
+        check(
+            "the page-access helper knows the browsers",
+            BrowserMediaController.scriptableBrowsers.contains { $0.name == "Google Chrome" }
+                && BrowserMediaController.scriptableBrowsers.contains { $0.name == "Safari" }
+        )
+        // Compile every script the browser backend actually sends. Chrome and
+        // Safari disagree about word order — Chrome takes the tab as the direct
+        // object, Safari locates it with `in` — and getting it wrong fails
+        // silently: the read just falls back to the tab title, which looks like
+        // a missing permission rather than a broken script. Only installed
+        // browsers can be compiled against; the rest have no dictionary here.
+        func compiles(_ source: String) -> Bool {
+            var errorInfo: NSDictionary?
+            _ = NSAppleScript(source: source)?.compileAndReturnError(&errorInfo)
+            return errorInfo == nil
+        }
+
+        let installed = BrowserMediaController.installedBrowsers
+        for browser in BrowserMediaController.scriptableBrowsers where installed.contains(browser.name) {
+            check(
+                "the \(browser.name) page-access probe compiles",
+                compiles(
+                    BrowserScriptAccess.probeScript(
+                        browser: browser.name,
+                        isChromeFamily: browser.isChromeFamily
+                    )
+                )
+            )
+            for script in BrowserMediaController.diagnosticScripts(forBrowserNamed: browser.name) ?? [] {
+                check("the \(browser.name) \(script.label) script compiles", compiles(script.source))
+            }
+        }
+        let outcomes: [BrowserScriptAccess.Outcome] = [
+            .alreadyOn("Safari"), .turnedOn("Safari"), .needsAccessibility,
+            .needsSafariDevelopMenu, .noBrowser, .noWindows("Safari"), .failed("x"),
+        ]
+        check("every page-access outcome explains itself", outcomes.allSatisfy { !$0.message.isEmpty })
+        check(
+            "only success reads as success",
+            outcomes.filter(\.isGood).count == 2
+        )
+        info(
+            "accessibility (needed for the page-access button)",
+            BrowserScriptAccess.shared.isTrustedForAccessibility ? "granted" : "not granted"
+        )
+        let hintDefault = Settings.shared.showPageAccessHint
+        Settings.shared.showPageAccessHint = false
+        check("the page-access hint can be switched off", !Settings.shared.showPageAccessHint)
+        Settings.shared.showPageAccessHint = hintDefault
+
+        // MARK: Themes
+        check("built-in themes are available", NotchTheme.builtIns.count >= 5)
+        let roundTrip = NotchTheme.decode(NotchTheme.encode(.red))
+        check(
+            "theme colours survive a round trip",
+            NSColor(roundTrip).isApproximately(NSColor(.red), tolerance: 0.01)
+        )
+
+        // MARK: Game
+        // Exercising the game writes a high score, so put the real one back
+        // afterwards — an earlier version of this test left 104 on the board
+        // before anyone had played a round.
+        let savedHighScore = Settings.shared.gameHighScore
+        let game = BreakoutGame.shared
+        let boardSize = CGSize(width: 640, height: 140)
+        var clock = Date()
+
+        game.advance(to: clock, size: boardSize)
+        check("the board fills with bricks", game.bricks.count == BreakoutGame.columns * 4)
+        check("the ball waits on the paddle", game.balls.count == 1)
+        check("a fresh run has three lives", game.lives == 3)
+
+        // The paddle is driven by the global pointer, mapped in through the
+        // board's on-screen rectangle. Nothing about this needs the keyboard,
+        // which is the point: the notch panel never becomes key.
+        game.boardScreenFrame = CGRect(x: 100, y: 900, width: 640, height: 140)
+        game.pointerMoved(to: CGPoint(x: 580, y: 950))
+        clock += 1.0 / 60
+        game.advance(to: clock, size: boardSize)
+        check("the paddle follows the pointer", abs(game.paddleCenterX - 480) < 1)
+
+        game.pointerMoved(to: CGPoint(x: 10_000, y: 950))
+        clock += 1.0 / 60
+        game.advance(to: clock, size: boardSize)
+        check(
+            "the paddle stays on the board",
+            game.paddleCenterX <= boardSize.width - game.paddleWidth / 2 + 0.01
+        )
+
+        // Five seconds of play, with the paddle parked under wherever the ball
+        // happens to be, so the rally keeps going.
+        for _ in 0 ..< 300 {
+            if let ball = game.balls.first {
+                game.pointerMoved(to: CGPoint(x: 100 + ball.position.x, y: 950))
+            }
+            clock += 1.0 / 60
+            game.advance(to: clock, size: boardSize)
+        }
+        check("bricks break when the ball reaches them", game.bricks.count < BreakoutGame.columns * 4)
+        check("play scores", game.score > 0)
+        check(
+            "every ball stays inside the board",
+            game.balls.allSatisfy { $0.position.x >= 0 && $0.position.x <= boardSize.width }
+        )
+        check("the high score follows the score", game.highScore >= game.score)
+
+        game.primaryAction()
+        check("clicking a live game pauses it", game.isPaused)
+        game.primaryAction()
+        check("clicking again resumes", !game.isPaused)
+
+        // MARK: Editor drags
+        // The Customize editors start a drag with an NSItemProvider, so they
+        // know one is under way, and receive it as a Transferable string. If
+        // that handoff failed, every drag in both editors would silently do
+        // nothing — adding, reordering and throwing away alike.
+        final class Box: @unchecked Sendable { var text: String? }
+        let payload = Box()
+        let provider = NSItemProvider(object: "funnotch-drag-test" as NSString)
+        _ = provider.loadTransferable(type: String.self) { result in
+            let text = try? result.get()
+            DispatchQueue.main.async { payload.text = text }
+        }
+        let dragDeadline = Date().addingTimeInterval(3)
+        while payload.text == nil, Date() < dragDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        check("a dragged widget arrives at a drop target intact", payload.text == "funnotch-drag-test",
+              detail: payload.text ?? "nothing arrived")
+
+        let savedBestLevel = Settings.shared.gameBestLevel
+        check(
+            "every board is fourteen cells wide",
+            BreakoutLevels.boards.allSatisfy { $0.rows.allSatisfy { $0.count == BreakoutGame.columns } }
+        )
+        check(
+            "every board has something to break",
+            BreakoutLevels.boards.allSatisfy { $0.rows.joined().contains(where: { "123X$?".contains($0) }) }
+        )
+
+        // Two explosives side by side: setting off one sets off the other, and
+        // between them they take the whole block.
+        game.loadForTesting(["1XX1", "1111"], size: boardSize)
+        let blockSize = game.bricks.count
+        game.breakForTesting(row: 0, column: 1)
+        game.settleForTesting(seconds: 0.5)
+        check(
+            "an explosion takes its neighbours and sets off the next",
+            game.bricks.isEmpty,
+            detail: "\(blockSize) → \(game.bricks.count)"
+        )
+        check("a chain of breaks raises the multiplier", game.multiplier >= 2, detail: "×\(game.multiplier)")
+
+        // Steel never breaks, so it cannot be what stands between you and the
+        // next board.
+        let levelBefore = game.level
+        game.loadForTesting(["#1"], size: boardSize)
+        game.breakForTesting(row: 0, column: 1)
+        // Two frames: the first after a resume only sets the clock.
+        for _ in 0 ..< 2 {
+            clock += 1.0 / 60
+            game.advance(to: clock, size: boardSize)
+        }
+        check("steel does not have to be broken to clear a board", game.level == levelBefore + 1)
+
+        check(
+            "the game's sounds synthesise",
+            GameSound.shared.frames(of: .boom) > 0 && GameSound.shared.frames(of: .brick(3)) > 0
+        )
+
+        Settings.shared.gameBestLevel = savedBestLevel
+        Settings.shared.gameHighScore = savedHighScore
+
+        // MARK: Dino Run
+        // Every check runs in preview mode, so nothing is written to the real
+        // high score or gem count.
+        let dino = DinoGame.shared
+        let dinoBoard = CGSize(width: 646, height: 132)
+
+        func runDino(seconds: Double, autopilot: Bool) {
+            for _ in 0 ..< Int(seconds * 60) {
+                if autopilot { dino.autopilot() }
+                dino.stepForTesting(frames: 1)
+            }
+        }
+
+        // A tap and a held press, from standing, and how high each goes.
+        func peak(holding seconds: Double) -> CGFloat {
+            dino.startForTesting(size: dinoBoard)
+            dino.press()
+            var top: CGFloat = 0
+            var held = 0.0
+            for _ in 0 ..< 90 {
+                if held >= seconds, dino.isHolding { dino.release() }
+                held += 1.0 / 60
+                dino.stepForTesting(frames: 1)
+                top = max(top, dino.height)
+            }
+            return top
+        }
+        let tap = peak(holding: 0.03)
+        let held = peak(holding: 0.4)
+        check("holding the jump goes higher than a tap", held > tap + 20,
+              detail: "tap \(Int(tap)) pt, held \(Int(held)) pt")
+        check("a full jump stays on the board", held + 34 < dinoBoard.height - DinoGame.groundDepth,
+              detail: "\(Int(held + 34)) of \(Int(dinoBoard.height - DinoGame.groundDepth)) pt")
+
+        // Every kind of obstacle, one after another, against a player who
+        // jumps the ground ones, ducks the middle birds and runs under the
+        // high ones. If any of them cannot be cleared, the game is unfair.
+        dino.startForTesting(size: dinoBoard)
+        let course: [(DinoGame.ObstacleKind, Int, Bool)] = [
+            (.cactus, 0, false), (.cactus, 0, true), (.rock, 0, false), (.bird, 0, false),
+            (.bird, 1, false), (.bird, 2, false), (.tumbleweed, 0, false),
+        ]
+        for (index, entry) in course.enumerated() {
+            dino.placeForTesting(entry.0, at: 300 + CGFloat(index) * 260, level: entry.1, tall: entry.2)
+        }
+        runDino(seconds: 9, autopilot: true)
+        check("every obstacle can be cleared", dino.phase == .running,
+              detail: dino.phase == .running ? "score \(dino.score)" : dino.lastCrash)
+
+        // Standing still into a cactus ends the run.
+        dino.startForTesting(size: dinoBoard)
+        dino.placeForTesting(.cactus, at: 200)
+        runDino(seconds: 2, autopilot: false)
+        check("running into a cactus ends the run", dino.phase == .crashed || dino.phase == .over)
+
+        // The highest pterodactyls can be run under without doing anything.
+        dino.startForTesting(size: dinoBoard)
+        dino.placeForTesting(.bird, at: 200, level: 2)
+        runDino(seconds: 2, autopilot: false)
+        check("a high pterodactyl can be run under", dino.phase == .running)
+
+        // The shield takes one hit, then it is gone.
+        dino.startForTesting(size: dinoBoard)
+        dino.grantForTesting(.shield)
+        dino.placeForTesting(.cactus, at: 200)
+        runDino(seconds: 2, autopilot: false)
+        check("the shield saves one hit", dino.phase == .running && !dino.hasShield)
+
+        // Turbo smashes through.
+        dino.startForTesting(size: dinoBoard)
+        dino.grantForTesting(.turbo)
+        dino.placeForTesting(.rock, at: 200)
+        runDino(seconds: 1.5, autopilot: false)
+        check("turbo smashes through obstacles", dino.phase == .running)
+
+        // Gems in the way are picked up.
+        dino.startForTesting(size: dinoBoard)
+        dino.placeGemForTesting(x: DinoGame.dinoX + 120, altitude: 14)
+        runDino(seconds: 1, autopilot: false)
+        check("running through a gem collects it", dino.gemsThisRun == 1)
+
+        // A hundred passed on a gem's bonus is still celebrated. It used to be
+        // checked only as distance was added, so a bonus jumping the score
+        // past a hundred skipped the chime and the glow.
+        dino.startForTesting(size: dinoBoard)
+        dino.setScoreForTesting(95)
+        dino.placeGemForTesting(x: DinoGame.dinoX + 30, altitude: 14)
+        runDino(seconds: 0.3, autopilot: false)
+        check("a hundred reached on a gem bonus still glows", dino.score >= 100 && dino.milestoneGlow > 0.4,
+              detail: "score \(dino.score), glow \(String(format: "%.2f", dino.milestoneGlow))")
+
+        // The run speeds up, and the day turns to night.
+        dino.startForTesting(size: dinoBoard)
+        let startSpeed = dino.speed
+        runDino(seconds: 40, autopilot: false)
+        check("the run gets faster", dino.speed > startSpeed + 60,
+              detail: "\(Int(startSpeed)) → \(Int(dino.speed)) pt/s")
+        dino.setScoreForTesting(0)
+        let morning = dino.nightness
+        dino.setScoreForTesting(950)
+        let night = dino.nightness
+        check("day turns to night as the score climbs", morning < 0.05 && night > 0.9,
+              detail: "\(morning) → \(night)")
+        dino.releaseForTesting()
+
+        let effects: [GameSound.Effect] = [
+            .paddle, .brick(1), .brick(9), .boom, .coin, .levelClear, .highScore,
+            .jump, .doubleJump, .land, .gem(0), .gem(8), .closeCall, .milestone, .shieldPop, .crash, .smash, .turbo, .exhaust, .streetBeat,
+        ]
+        let loudest = effects.map { GameSound.shared.peak(of: $0) }.max() ?? 0
+        check("every sound synthesises without clipping",
+              effects.allSatisfy { GameSound.shared.frames(of: $0) > 0 } && loudest < 1,
+              detail: String(format: "peak %.2f", loudest))
+
+        // MARK: Drag-to-notch drop zone
+        // Clear anything the focus checks left on screen so the sizes compare cleanly.
+        controller.viewModel.expandingView = SneakPeek()
+        controller.viewModel.sneakPeek = SneakPeek()
+        let idleWidth = controller.viewModel.contentSize.width
+        controller.viewModel.dragDetectorTargeting = true
+        let dragSize = controller.viewModel.contentSize
+        check(
+            "a live drag widens the notch into a drop zone",
+            dragSize.width > idleWidth,
+            detail: "\(Int(idleWidth)) → \(Int(dragSize.width))"
+        )
+        check(
+            "the drop zone is taller than the collapsed notch",
+            dragSize.height > notch.height
+        )
+        check(
+            "the drop target grows with it",
+            controller.hoverRect.width >= dragSize.width - 1
+        )
+        controller.viewModel.dragDetectorTargeting = false
+        check(
+            "the notch shrinks back when the drag ends",
+            abs(controller.viewModel.contentSize.width - idleWidth) < 1
+        )
+        check(
+            "the pasteboard filter ignores empty content",
+            !MouseTracker.pasteboardHasAcceptableContent(NSPasteboard(name: .init("funnotch.selftest.empty")))
+        )
+
+        // MARK: Pointer routing → open / close
+        let viewModel = controller.viewModel
+        let hoverRect = controller.hoverRect
+        info("hover rect", "\(hoverRect)")
+        check("hover rect covers the notch", hoverRect.width >= notch.width - 1)
+
+        // Remember the user's real preferences; the test overrides a few.
+        let saved = (
+            hover: Settings.shared.openNotchOnHover,
+            delay: Settings.shared.minimumHoverDuration
+        )
+        restoreSettings = {
+            Settings.shared.openNotchOnHover = saved.hover
+            Settings.shared.minimumHoverDuration = saved.delay
+        }
+
+        Settings.shared.openNotchOnHover = true
+        Settings.shared.minimumHoverDuration = 0.05
+
+        let inside = CGPoint(x: hoverRect.midX, y: hoverRect.midY)
+        let outside = CGPoint(x: screen.frame.midX, y: screen.frame.midY)
+
+        // Detach the real monitors first. They stay live during the test, and a
+        // physical pointer sitting outside the notch would report "not hovering"
+        // in between the synthetic move and the hover delay firing, cancelling
+        // the very thing being measured. The callback itself is untouched, so
+        // this still exercises the real routing.
+        MouseTracker.shared.stop()
+
+        // Drive the exact callback the global mouse monitor uses.
+        let menuPoint = CGPoint(x: hoverRect.maxX + 1, y: hoverRect.midY)
+        MouseTracker.shared.onMove?(menuPoint)
+        check("hovering the menu bar beside the cutout does not open the notch", !viewModel.isHovering && viewModel.notchState == .closed)
+        if viewModel.usesPhysicalCutout {
+            check("the closed hover area matches the hardware cutout", hoverRect.size == viewModel.closedNotchSize)
+            check("menu bar icons receive clicks beside the closed cutout", controller.panel.ignoresMouseEvents)
+            if viewModel.showsCodexMenu {
+                let badge = controller.panel.convertToScreen(viewModel.codexBadgeRect)
+                let badgePoint = CGPoint(x: badge.midX, y: badge.midY)
+                check("Codex sits directly to the right of the cutout", badge.minX - hoverRect.maxX == 4 && badge.midY == hoverRect.midY)
+                MouseTracker.shared.onMove?(badgePoint)
+                check("Codex receives clicks while the notch stays collapsed",
+                      !controller.panel.ignoresMouseEvents && !viewModel.isHovering && viewModel.notchState == .closed)
+                MouseTracker.shared.onMove?(CGPoint(x: badge.maxX + 1, y: badge.midY))
+                check("the menu bar beside Codex still receives clicks", controller.panel.ignoresMouseEvents)
+            }
+        }
+        MouseTracker.shared.onMove?(inside)
+        check("pointer inside the notch registers as hovering", viewModel.isHovering)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            check("hovering opens the notch", viewModel.notchState == .open)
+            let openRect = controller.hoverRect
+            if viewModel.usesPhysicalCutout {
+                check("the expanded panel sits below the menu bar", openRect.maxY == hoverRect.minY)
+                check("the cursor can travel from the cutout into the panel", controller.containsHoverPoint(inside))
+                MouseTracker.shared.onMove?(menuPoint)
+                check("menu bar icons receive clicks beside the expanded notch", controller.panel.ignoresMouseEvents)
+                MouseTracker.shared.onMove?(CGPoint(x: openRect.midX, y: openRect.midY))
+                check("the expanded notch accepts clicks within its panel", !controller.panel.ignoresMouseEvents)
+            }
+            check(
+                "the open notch grows to its full size",
+                abs(openRect.width - openNotchSize.width) < 1,
+                detail: "\(openRect.width)"
+            )
+
+            MouseTracker.shared.onMove?(outside)
+            check("pointer leaving clears hover", !viewModel.isHovering)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                check("leaving closes the notch", viewModel.notchState == .closed)
+
+                checkHoverRecovery(viewModel) {
+                    // MARK: HUD path
+
+                    // Give the media backend time to answer before reporting.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        checkDragPlumbing(panel, notchHeight: notch.height, phase: "settled")
+                        checkDropPath(controller)
+                        let track = MusicManager.shared.track
+                        if track.isEmpty {
+                            info("now playing", "nothing reported (no player running, or automation access not yet granted)")
+                        } else {
+                            info("now playing", "\(track.title) — \(track.artist) [\(track.isPlaying ? "playing" : "paused")]")
+                            info("track duration", "\(Int(track.duration))s")
+                            info("artwork", track.artwork == nil ? "none" : "loaded")
+                        }
+                        let remaining = max(0, completionNotice.date.addingTimeInterval(CodexCompletionFlight.duration * 2 + 0.15).timeIntervalSinceNow)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + remaining) {
+                            check("completion queue drains and releases its state",
+                                  completionModel.codexCompletion == nil && stoppedModel.codexCompletion == nil)
+                            finish()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reproduces opens with no mouse-enter event, a pin released outside,
+    /// and a return before the close deadline using the production model.
+    private static func checkHoverRecovery(_ model: NotchViewModel, completion: @escaping () -> Void) {
+        model.setHovering(false)
+        model.open()
+        model.setHovering(false)
+        check("opening without a preceding hover still opens immediately", model.notchState == .open)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            check("an outside pointer closes a click or programmatic open", model.notchState == .closed)
+            model.pinnedOpen = true
+            model.open()
+            model.setHovering(false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                check("an explicit pin keeps an outside notch open", model.notchState == .open)
+                model.pinnedOpen = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    check("releasing the pin outside resumes automatic closing", model.notchState == .closed)
+                    model.open()
+                    model.setHovering(true)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        check("returning inside cancels an earlier close", model.notchState == .open)
+                        model.setHovering(false)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+                            model.setHovering(false)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.13) {
+                                check("repeated outside samples cannot postpone closing", model.notchState == .closed)
+                                completion()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    /// Walks the panel looking for a view that accepts dragged types, and
+    /// checks that hit testing can actually reach SwiftUI's content.
+    private static func checkDragPlumbing(_ panel: NSWindow, notchHeight: CGFloat, phase: String) {
+        guard let contentView = panel.contentView else { return }
+
+        var registered: [(String, [String])] = []
+        func walk(_ view: NSView) {
+            let types = view.registeredDraggedTypes.map(\.rawValue)
+            if !types.isEmpty { registered.append(("\(type(of: view))", types)) }
+            view.subviews.forEach(walk)
+        }
+        walk(contentView)
+
+        info("[\(phase)] views registered for drags", "\(registered.count)")
+        for entry in registered {
+            info("[\(phase)]   \(entry.0)", entry.1.prefix(6).joined(separator: ", "))
+        }
+
+        let notchCentre = NSPoint(x: windowSize.width / 2, y: windowSize.height - notchHeight / 2)
+        let hit = contentView.hitTest(notchCentre)
+        info("[\(phase)] hit test at the notch centre", hit.map { "\(type(of: $0))" } ?? "nil")
+
+        if phase == "settled" {
+            check(
+                "the content view accepts file drags",
+                contentView.registeredDraggedTypes.contains(.fileURL)
+            )
+            check("hit testing reaches the notch", hit != nil)
+        }
+    }
+
+    /// Drives the real drop path with a pasteboard shaped like a Finder drag.
+    private static func checkDropPath(_ controller: NotchWindowController) {
+        guard let contentView = controller.panel.contentView as? PassthroughContentView else {
+            check("the content view is the drag destination", false)
+            return
+        }
+        check("the content view is the drag destination", true)
+
+        // While a drag is in flight the catch area covers the top of the window,
+        // so the drop does not have to be aimed at the collapsed notch.
+        controller.viewModel.dragDetectorTargeting = false
+        let idleBelow = contentView.hitTest(NSPoint(x: windowSize.width / 2, y: windowSize.height - 90))
+        controller.viewModel.dragDetectorTargeting = true
+        let dragBelow = contentView.hitTest(NSPoint(x: windowSize.width / 2, y: windowSize.height - 90))
+        check("idle, the notch ignores points well below it", idleBelow == nil)
+        check("mid-drag, the catch area extends below the notch", dragBelow != nil)
+
+        let farLeft = contentView.hitTest(NSPoint(x: 20, y: windowSize.height - 40))
+        check("mid-drag, the catch area spans the window width", farLeft != nil)
+
+        check(
+            "the window leaves room for the shadow on every side",
+            windowSize.width - openNotchSize.width == shadowPadding * 2
+                && windowSize.height - gameNotchSize.height == shadowPadding + notchMenuBarAllowance,
+            detail: "\(Int(windowSize.width))×\(Int(windowSize.height)) around \(Int(openNotchSize.width))×\(Int(openNotchSize.height))"
+        )
+        controller.viewModel.dragDetectorTargeting = false
+        controller.viewModel.previewOpen()
+        let openRect = NotchWindowController.liveRect(for: controller.viewModel)
+        check(
+            "the open notch stays centred in it",
+            abs(openRect.midX - windowSize.width / 2) < 0.01,
+            detail: "\(openRect.midX) vs \(windowSize.width / 2)"
+        )
+        check(
+            "with the shadow margin clear on both sides",
+            openRect.minX >= shadowPadding - 0.01 && openRect.maxX <= windowSize.width - shadowPadding + 0.01,
+            detail: "\(Int(openRect.minX)) … \(Int(windowSize.width - openRect.maxX))"
+        )
+        controller.viewModel.currentTab = .game
+        let poolRect = NotchWindowController.liveRect(for: controller.viewModel)
+        check("the game board fits inside the panel", poolRect.height == gameNotchSize.height && poolRect.minY >= shadowPadding)
+        check("the bottom of the game board accepts pointer input",
+              contentView.hitTest(CGPoint(x: poolRect.midX, y: poolRect.minY + 25)) != nil)
+        controller.viewModel.currentTab = .home
+        check("other tabs retain their original height", controller.viewModel.contentSize == openNotchSize)
+        controller.viewModel.close()
+        controller.viewModel.dragDetectorTargeting = false
+
+        // A file URL on a pasteboard is exactly what Finder hands over.
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("funnotch-drop-test.txt")
+        try? "dropped".write(to: file, atomically: true, encoding: .utf8)
+
+        let pasteboard = NSPasteboard(name: .init("funnotch.selftest.drop"))
+        pasteboard.clearContents()
+        pasteboard.writeObjects([file as NSURL])
+
+        let before = ShelfManager.shared.items.count
+        let accepted = controller.dragDidDrop(pasteboard)
+        check("a dropped file is accepted", accepted)
+        check(
+            "the dropped file lands on the shelf",
+            ShelfManager.shared.items.count == before + 1,
+            detail: "\(before) → \(ShelfManager.shared.items.count)"
+        )
+        check("the drop switches to the shelf tab", controller.viewModel.currentTab == .shelf)
+
+        if let item = ShelfManager.shared.items.first(where: { $0.url == file }) {
+            check("the shelf kept the right file", item.name == "funnotch-drop-test.txt")
+            ShelfManager.shared.remove(id: item.id)
+        } else {
+            check("the shelf kept the right file", false)
+        }
+        try? FileManager.default.removeItem(at: file)
+
+        // Text drags should become a file too, so they can be dragged back out.
+        let textBoard = NSPasteboard(name: .init("funnotch.selftest.text"))
+        textBoard.clearContents()
+        textBoard.setString("hello from a drag", forType: .string)
+        let textBefore = ShelfManager.shared.items.count
+        check("dropped text is accepted", controller.dragDidDrop(textBoard))
+        check("dropped text becomes a shelf file", ShelfManager.shared.items.count == textBefore + 1)
+        if let item = ShelfManager.shared.items.first {
+            ShelfManager.shared.remove(id: item.id)
+        }
+
+        controller.viewModel.currentTab = .home
+        controller.viewModel.pinnedOpen = false
+    }
+
+    private static func finish() {
+        restoreSettings?()
+        print("=== \(failures.isEmpty ? "all checks passed" : "\(failures.count) check(s) failed") ===")
+        for failure in failures {
+            print("  - \(failure)")
+        }
+        exit(failures.isEmpty ? 0 : 1)
+    }
+}

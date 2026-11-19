@@ -1,0 +1,51 @@
+name: Release build check
+
+# Push a tag like v1.3 and this builds the universal app from that tag and runs
+# the self-test on a clean machine, so a release never ships source that only
+# builds on one Mac. The results are kept as a workflow artifact.
+#
+# It deliberately does NOT attach anything to the GitHub Release. Releases are
+# built, self-tested and EdDSA-signed locally (the signing key never leaves the
+# login Keychain — see Tools/make-appcast.sh), and a Sparkle signature only
+# matches the exact bytes it was made for. This workflow used to upload its own
+# rebuilt dmgs over the signed ones a few minutes after each release, so the
+# files on GitHub stopped matching appcast.xml and every in-app update of 1.1
+# and 1.2 failed with "The update is improperly signed". After a release, run
+# Tools/verify-appcast.sh to check the published files against the appcast.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version && xcodebuild -version
+
+      - name: Build universal and package
+        run: |
+          chmod +x build.sh
+          ./build.sh --universal --package
+
+      # The suite drives the real window manager, so it needs a GUI session.
+      # It is allowed to fail the job — a broken release is worse than a slow one.
+      - name: Self-test
+        run: build/FunNotch.app/Contents/MacOS/FunNotch --self-test
+
+      - name: Keep the build for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: FunNotch-${{ github.ref_name }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          retention-days: 14
